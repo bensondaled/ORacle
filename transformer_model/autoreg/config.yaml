@@ -1,0 +1,183 @@
+alpha_trend: 0.6
+balance_hypo_finetune: false
+batch_size_bp: 8192
+bolus_cols:
+- meds_dexmedetomidine_bolus
+- meds_ephedrine_bolus
+- meds_esmolol_bolus
+- meds_etomidate_bolus
+- meds_epinephrine_bolus
+- meds_fentanyl_bolus
+- meds_glycopyrrolate_bolus
+- meds_hydromorphone_bolus
+- meds_ketamine_bolus
+- meds_labetalol_bolus
+- meds_norepinephrine_bolus
+- meds_phenylephrine_bolus
+- meds_propofol_bolus
+- meds_remifentanil_bolus
+- meds_vasopressin_bolus
+bolus_column_weights:
+  meds_dexmedetomidine_bolus: 0.822
+  meds_ephedrine_bolus: 0.075
+  meds_epinephrine_bolus: 0.439
+  meds_esmolol_bolus: 0.712
+  meds_etomidate_bolus: 3.173
+  meds_fentanyl_bolus: 0.034
+  meds_glycopyrrolate_bolus: 0.235
+  meds_hydromorphone_bolus: 0.186
+  meds_ketamine_bolus: 0.204
+  meds_labetalol_bolus: 0.447
+  meds_norepinephrine_bolus: 6.483
+  meds_phenylephrine_bolus: 0.033
+  meds_propofol_bolus: 0.034
+  meds_remifentanil_bolus: 0.151
+  meds_vasopressin_bolus: 1.973
+bolus_plot_mode: separate
+bolus_steps_after: 5
+bolus_weighting_decay: linear
+bp_dim_ff: 256
+bp_dropout: 0.1
+bp_embed_dim: 128
+bp_nhead: 8
+bp_num_layers: 8
+cache_path: /home/marcgh/intraop_model/outputs/token_dilate
+data_percentage: 1
+decoder_type: transformer
+epochs_bp: 3
+eval_at_epoch1: false
+finetune_bolus_only: false
+finetune_hypo_only: false
+finetune_unfrozen_layers:
+- hypo_onset_head
+first_continuity_weight: 0.2
+first_penalty_weight: 0.8
+force_recompute_batches: false
+force_train_vae: false
+freeze_except_hypo_head: false
+future_steps: 15
+gradient_clip_val: 1.0
+hypo_balance_ratio: 1.0
+hypo_focal_alpha: 0.25
+hypo_focal_gamma: 2.0
+hypo_loss_weights:
+- 0.5
+- 0.5
+hypo_pos_weight: 5.0
+learned_quantile: false
+loader:
+  shuffle: false
+  use_balanced_sampler: false
+log_every_batches: 50
+log_every_epochs: 1
+log_gradient_norm: false
+log_umap: false
+logging_level: info
+loss_init_weight: 1.0
+loss_keys:
+- mse
+- dilate
+loss_min_weight: 0.01
+loss_mode: scheduled
+loss_schedule:
+  mse:
+    start_weight: 1.0
+    end_weight: 0.3
+    num_epochs: 10
+  dilate:
+    start_weight: 0.1
+    end_weight: 1.0
+    num_epochs: 10
+
+# NEW: Drug-specific bolus multipliers
+bolus_loss_multipliers:
+  mse: 2.0
+  dilate: 3.0
+lr_bp: 0.0001
+lr_scheduler: cosine
+max_len: 60
+min_history_steps: 5  # Minimum historical rows before allowing predictions
+med_cols:
+- meds_dexmedetomidine
+- meds_ephedrine
+- meds_esmolol
+- meds_etomidate
+- meds_epinephrine
+- meds_fentanyl
+- meds_glycopyrrolate
+- meds_hydromorphone
+- meds_ketamine
+- meds_labetalol
+- meds_norepinephrine
+- meds_phenylephrine
+- meds_propofol
+- meds_remifentanil
+- meds_vasopressin
+num_workers: 12
+persistent_workers: true
+pin_memory: true
+pos_encoding_type: sinusoidal  # Options: learned, sinusoidal, medical, adaptive
+num_bolus_drugs: 15  # Number of bolus drug types for enhanced encoding
+prefetch_factor: 16
+preprocess_mode: rebuild
+pretrained_checkpoint: /home/marcgh/intraop_model/outputs/runs/test_run_gru_scheduled_20250512_181520/best_test_run_gru_scheduled_20250512_181520_ep2.pt
+quantile_init: 0.5
+quantile_level: 0.9
+recompute_tokens: false
+reset_hypo_head: false
+resume: false
+run_name: test_run_gru_scheduled_20250519_174102_gru_scheduled_20250623_104914
+save_path: /home/marcgh/intraop_model/outputs/runs
+scheduler_eta_min: 1.0e-06
+scheduler_gamma: 0.5
+scheduler_step_size: 5
+scheduler_t_max: 10
+static_categoricals:
+- sex
+static_combine_mode: concat
+static_embed_dim: 16
+static_numericals:
+- age
+- weight
+stride: 1
+sweep_mode: false
+target_cols:
+- phys_bp_sys_non_invasive
+- phys_bp_dias_non_invasive
+- phys_bp_mean_non_invasive
+- phys_spo2_%
+- phys_spo2_pulse_rate
+- phys_end_tidal_co2_(mmhg)
+task_mode: autoreg
+test_path: /remote/private/spede/or_foundational/shared_datasets/marc_split_05.28.25/test_split_likeold.feather
+train_path: /remote/private/spede/or_foundational/shared_datasets/marc_split_05.28.25/train_split_likeold.feather
+
+trend_diff_weights:
+- 0.5
+- 0.5
+use_batch_caching: true
+use_bolus_weights: true
+use_compile: true
+use_focal_loss: true
+use_hypo_onset_bp: false
+use_hypo_onset_fused: false
+use_lr_scheduler: true
+use_mixed_precision: true
+use_quantile_in_hypo: false
+use_smart_stride: false
+val_path: /remote/private/spede/or_foundational/shared_datasets/marc_split_05.28.25/val_split_likeold.feather
+verify_normalization: false
+vital_cols:
+- phys_bp_sys_non_invasive
+- phys_bp_dias_non_invasive
+- phys_bp_mean_non_invasive
+- phys_spo2_%
+- phys_spo2_pulse_rate
+- phys_end_tidal_co2_(mmhg)
+- phys_desflurane_exp_%
+- phys_isoflurane_exp_%
+- phys_sevoflurane_exp_%
+- phys_nitrous_exp_%
+wandb_project: flexible_bp_autoreg
+wd_bp: 5.0e-05
+zero_hypo_head_bias: false

@@ -1,0 +1,315 @@
+import torch
+from torch.utils.data import Dataset
+import pandas as pd
+import numpy as np
+from typing import Dict, Any, List, Tuple
+import logging
+import random
+
+logger = logging.getLogger(__name__)
+
+class IntraOpDataset(Dataset):
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        config: Dict[str, Any],
+        vocabs: Dict[str, Any],
+        split: str = "train",
+        balance_hypo_finetune: bool = False,
+        hypo_balance_ratio: float = 1.0
+    ):
+        logger.info(f"Initializing IntraOpDataset with df rows={len(df)}, cases={df['mpog_case_id'].nunique()}")
+        self.df = df.copy()
+        self.config = config
+        self.vital_cols = config['vital_cols']
+        self.med_cols = config['med_cols']
+        self.gas_cols = config.get('gas_cols', [])  # FIXED: Add gas columns
+        self.bolus_cols = config.get('bolus_cols', [])
+        self.max_len = config['max_len']
+        self.future_steps = config['future_steps']
+        self.static_cat_cols = config.get('static_categoricals', [])
+        self.static_num_cols = config.get('static_numericals', [])
+        self.patient_id_col = config.get('patient_id_col', 'mpog_case_id') # Add this line
+        self.target_cols = config.get('target_cols', ['phys_bp_mean_non_invasive'])
+        self.vocab_maps = vocabs or {}
+        self.split = split
+        self.balance_hypo_finetune = balance_hypo_finetune
+        self.hypo_balance_ratio = hypo_balance_ratio
+
+        self.hypo_onset_labels = np.array(self.df.get("hypo_onset_label", [0] * len(self.df)), dtype=np.float32)
+        self.hypo_onset_types = np.array(self.df.get("hypo_onset_type", ["none"] * len(self.df)), dtype=str)
+
+        unique_labels, counts = np.unique(self.hypo_onset_labels, return_counts=True)
+        logger.info(f"🦧 hypo_onset_label counts: {dict(zip(unique_labels.astype(int), counts))}")
+        unique_types, type_counts = np.unique(self.hypo_onset_types, return_counts=True)
+        logger.info(f"🦧 hypo_onset_type counts: {dict(zip(unique_types, type_counts))}")
+
+        # Validate required columns
+        required_cols = set(self.vital_cols + self.med_cols + self.gas_cols + self.target_cols + self.bolus_cols)
+        if 'mpog_case_id' not in self.df.columns:
+            raise ValueError("Missing 'mpog_case_id' column")
+        missing = required_cols - set(self.df.columns)
+        if missing:
+            raise ValueError(f"Missing columns: {sorted(missing)}")
+
+        # Process static categorical columns
+        for col in self.static_cat_cols:
+            if col in self.df.columns and col in self.vocab_maps:
+                self.df[col] = self.df[col].map(self.vocab_maps[col]).fillna(0).astype(int)
+            else:
+                logger.warning(f"Skipping static categorical column {col}: missing in df or vocabs")
+
+        # Filter cases with sufficient length for early prediction
+        grouped = self.df.groupby('mpog_case_id')
+        # Changed: minimum length is just future_steps + 1 (to predict from t=1)
+        min_len = self.future_steps + 1
+        logger.info(f"🔍 Before filtering: {len(grouped.groups)} cases, min_len required: {min_len}")
+        valid_case_ids = [cid for cid in grouped.groups.keys() if len(grouped.get_group(cid)) >= min_len]
+        logger.info(f"🔍 After filtering: {len(valid_case_ids)} valid cases")
+        self.df = self.df[self.df['mpog_case_id'].isin(valid_case_ids)].copy()
+        logger.info(f"🔍 After DataFrame filter: df has {len(self.df)} rows, {self.df['mpog_case_id'].nunique()} unique cases")
+        self.grouped = self.df.groupby('mpog_case_id')
+        logger.info(f"🔍 Final grouped object has {len(self.grouped.groups)} groups")
+
+        all_samples = self._generate_samples()
+
+        if balance_hypo_finetune and split == "train":
+            self.samples = self._balance_hypo_samples(all_samples, ratio=hypo_balance_ratio)
+            logger.info(f"✅ Balanced hypo-onset samples: {len(self.samples)} total")
+        else:
+            self.samples = all_samples
+
+        unique_cases_in_samples = len(set(cid for cid, _ in self.samples))
+        logger.info(f"📦 Generated {len(self.samples)} samples across {unique_cases_in_samples} cases")
+
+    def _generate_samples(self) -> List[Tuple[str, int]]:
+        samples = []
+        stride = self.config.get('stride', 1)
+        required_past_steps = self.config.get('min_history_steps', 5)  # Configurable minimum history
+        
+        case_ids = list(self.grouped.groups.keys())
+        logger.info(f"🔍 Processing {len(case_ids)} case IDs for sample generation")
+        
+        cases_with_samples = set()
+        for i, cid in enumerate(case_ids):
+            # Progress logging every 10k cases
+            if i % 10000 == 0:
+                logger.info(f"🔍 Processing case {i+1}/{len(case_ids)}")
+                
+            group = self.grouped.get_group(cid)
+            num_rows = len(group)
+            max_end = num_rows - self.future_steps + 1
+            
+            if max_end <= required_past_steps:
+                continue
+
+            # OPTIMIZED: Generate all sample endpoints at once
+            case_samples_count = 0
+            for end in range(required_past_steps, max_end, stride):
+                # OPTIMIZED: Skip expensive row access during sample generation
+                samples.append((cid, end))
+                case_samples_count += 1
+            
+            if case_samples_count > 0:
+                cases_with_samples.add(cid)
+        
+        logger.info(f"🔍 Generated samples for {len(cases_with_samples)} unique cases")
+        return samples
+
+    def _balance_hypo_samples(self, samples, ratio=1.0):
+        pos, neg = [], []
+        
+        for cid, end in samples:
+            group = self.grouped.get_group(cid)
+            start = max(0, end - self.max_len)
+            window = group.iloc[start:end]
+            
+            # Get label from the last timestep in window
+            if len(window) > 0:
+                label = float(window.iloc[-1].get("hypo_onset_label", 0))
+            else:
+                label = 0.0
+                
+            if label == 1:
+                pos.append((cid, end))
+            else:
+                neg.append((cid, end))
+
+        # Balance the samples
+        if len(pos) > 0:
+            n_neg = min(len(neg), int(len(pos) * ratio))
+            neg_sampled = random.sample(neg, n_neg) if n_neg > 0 else []
+            balanced_samples = pos + neg_sampled
+        else:
+            # If no positive samples, take all negative samples
+            balanced_samples = neg
+            
+        logger.info(f"Balanced samples: {len(pos)} positive, {len(neg_sampled) if len(pos) > 0 else len(neg)} negative")
+        return balanced_samples
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        cid, end = self.samples[idx]
+        group = self.grouped.get_group(cid)
+        
+        # Calculate window boundaries
+        start = max(0, end - self.max_len)
+        window = group.iloc[start:end]
+        future = group.iloc[end:end + self.future_steps]
+        seq_len = len(window)
+        
+        # PERFORMANCE: Removed expensive memory monitoring (every 1000 samples)
+        # This was causing slowdown during data loading
+        
+        # DTYPE OPTIMIZED: Use float16 for input data to save memory and bandwidth
+        vitals = np.zeros((self.max_len, len(self.vital_cols)), dtype=np.float16)
+        meds = np.zeros((self.max_len, len(self.med_cols)), dtype=np.float16)
+        gases = np.zeros((self.max_len, len(self.gas_cols)), dtype=np.float16) if self.gas_cols else np.zeros((self.max_len, 0), dtype=np.float16)
+        bolus = np.zeros((self.max_len, len(self.bolus_cols)), dtype=np.float16) if self.bolus_cols else np.zeros((self.max_len, 0), dtype=np.float16)
+        attention_mask = torch.zeros(self.max_len, dtype=torch.bool)
+
+        # Fill arrays with actual data (right-aligned)
+        if seq_len > 0:
+            # DTYPE OPTIMIZED: Use float16 for input data
+            vitals[-seq_len:] = window[self.vital_cols].values.astype(np.float16)
+            meds[-seq_len:] = window[self.med_cols].values.astype(np.float16)
+            
+            if self.gas_cols:
+                gases[-seq_len:] = window[self.gas_cols].values.astype(np.float16)
+            
+            if self.bolus_cols:
+                bolus[-seq_len:] = window[self.bolus_cols].values.astype(np.float16)
+            
+            attention_mask[-seq_len:] = True
+
+        # Get bolus values from the current timestep (last row in window)
+        bolus_values = np.zeros(len(self.bolus_cols), dtype=np.float16)
+        if self.bolus_cols and seq_len > 0:
+            last_row = window.iloc[-1]
+            for i, col in enumerate(self.bolus_cols):
+                bolus_values[i] = float(last_row.get(col, 0.0))
+
+        # DTYPE OPTIMIZED: Use float16 for targets (will be upcast to float32 during loss computation)
+        if len(future) != self.future_steps:
+            # Pad or truncate as needed
+            future_values = np.zeros((self.future_steps, len(self.target_cols)), dtype=np.float16)
+            actual_len = min(len(future), self.future_steps)
+            if actual_len > 0:
+                future_values[:actual_len] = future[self.target_cols].iloc[:actual_len].values.astype(np.float16)
+            target_array = future_values
+        else:
+            target_array = future[self.target_cols].values.astype(np.float16)
+            
+        target = torch.tensor(np.nan_to_num(target_array, nan=0.0), dtype=torch.float32)
+
+        # Static features from current timestep
+        current_row_idx = end - 1
+        current_row = group.iloc[current_row_idx]
+        
+        static_cat = {}
+        for col in self.static_cat_cols:
+            if col in current_row.index:
+                vocab_map = self.vocab_maps.get(col, {})
+                value = vocab_map.get(current_row[col], 0)
+                static_cat[col] = torch.tensor(value, dtype=torch.long)
+            else:
+                static_cat[col] = torch.tensor(0, dtype=torch.long)
+                
+        static_num = None
+        if self.static_num_cols:
+            num_values = []
+            for col in self.static_num_cols:
+                if col in current_row.index:
+                    num_values.append(float(current_row[col]))
+                else:
+                    num_values.append(0.0)
+            static_num = torch.tensor(num_values, dtype=torch.float32)
+
+        # Handle BP-related features
+        if self.target_cols[0] in self.vital_cols:
+            bp_index = self.vital_cols.index(self.target_cols[0])
+            
+            # Get actual BP values from non-padded part
+            if seq_len > 0:
+                actual_bp_values = vitals[-seq_len:, bp_index]
+                # Get last 5 values, pad with zeros if needed
+                if seq_len >= 5:
+                    last5_bp = actual_bp_values[-5:].tolist()
+                else:
+                    last5_bp = [0.0] * (5 - seq_len) + actual_bp_values.tolist()
+            else:
+                last5_bp = [0.0] * 5
+        else:
+            last5_bp = [0.0] * 5
+
+        # Labels from current timestep
+        if seq_len > 0:
+            hypo_onset_label = float(window.iloc[-1].get("hypo_onset_label", 0))
+            hypo_onset_type = str(window.iloc[-1].get("hypo_onset_type", "none"))
+        else:
+            hypo_onset_label = 0.0
+            hypo_onset_type = "none"
+
+        # Handle UUID strings by converting to hash
+        case_id_value = current_row[self.patient_id_col]
+        if isinstance(case_id_value, str):
+            patient_id = torch.tensor(hash(case_id_value) % (2**31), dtype=torch.long)
+        else:
+            patient_id = torch.tensor(int(case_id_value), dtype=torch.long)
+
+        # DTYPE OPTIMIZED: Create float16 tensors for memory efficiency (autocast will handle precision)
+        result = {
+            'vitals': torch.from_numpy(vitals),  # float16
+            'meds': torch.from_numpy(meds),     # float16  
+            'gases': torch.from_numpy(gases),   # float16
+            'bolus': torch.from_numpy(bolus),   # float16
+            'last_input_bolus': torch.from_numpy(bolus_values),  # float16
+            'target': target,
+            'attention_mask': attention_mask,
+            'static_cat': static_cat,
+            'static_num': static_num,
+            'patient_id': patient_id,
+            'original_index': torch.tensor(current_row.name, dtype=torch.long),
+            'minutes_elapsed': torch.tensor(float(current_row.get('time_since_start', 0)), dtype=torch.float32),
+            'mpog_case_id': cid,
+            'last5_bp_values': torch.from_numpy(np.array(last5_bp, dtype=np.float16)),
+            'last_known_bp': torch.tensor(last5_bp[-1], dtype=torch.float32),
+            'hypo_onset_label': torch.tensor(hypo_onset_label, dtype=torch.float32),
+            'hypo_onset_type': hypo_onset_type,
+            'actual_sequence_length': torch.tensor(seq_len, dtype=torch.long),
+            'prediction_timestep': torch.tensor(end, dtype=torch.long),
+        }
+        
+        return result
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    @staticmethod
+    def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+        result = {}
+        keys = batch[0].keys()
+        
+        for key in keys:
+            if key == "static_cat":
+                # Handle static categorical features
+                result[key] = {}
+                for cat_key in batch[0][key].keys():
+                    result[key][cat_key] = torch.stack([item[key][cat_key] for item in batch])
+                    
+            elif key == "static_num":
+                # Handle static numerical features
+                static_nums = [item[key] for item in batch if item[key] is not None]
+                if static_nums:
+                    result[key] = torch.stack(static_nums)
+                else:
+                    result[key] = None
+                    
+            elif key in ["hypo_onset_type", "mpog_case_id", "patient_id"]:
+                # Keep as lists for string values
+                result[key] = [item[key] for item in batch]
+                
+            else:
+                # Stack tensor values
+                result[key] = torch.stack([item[key] for item in batch])
+                
+        return result

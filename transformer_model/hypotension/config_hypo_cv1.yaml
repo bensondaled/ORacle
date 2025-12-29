@@ -1,0 +1,110 @@
+# =========================================
+# Hypotension Classifier - CV Run 1
+# =========================================
+
+# --------------------
+# 📁 PATHS AND SAVING
+# --------------------
+train_path: /remote/home/marcgh/CV_intraop_model/cv_splits_new/cv_run_1/train_NORMALIZED_with_hypo.feather
+val_path: /remote/home/marcgh/CV_intraop_model/cv_splits_new/cv_run_1/test_NORMALIZED_with_hypo.feather
+test_path: /remote/home/marcgh/CV_intraop_model/cv_splits_new/cv_run_1/test_NORMALIZED_with_hypo.feather
+
+save_path: /remote/home/marcgh/CV_intraop_model/runs/hypo_cv1
+run_name: hypo_cv1_run
+wandb_project: hypo_classification_cv
+output_dir: /remote/home/marcgh/CV_intraop_model/runs/hypo_cv1/predictions
+
+# ---------------------------
+# 🧪 INPUT FEATURES
+# ---------------------------
+vital_cols:
+  - phys_bp_sys_non_invasive
+  - phys_bp_dias_non_invasive
+  - phys_bp_mean_non_invasive
+  - phys_spo2_%
+  - phys_spo2_pulse_rate
+  - phys_end_tidal_co2_(mmhg)
+  - phys_desflurane_exp_%
+  - phys_isoflurane_exp_%
+  - phys_sevoflurane_exp_%
+  - phys_nitrous_exp_%
+
+med_cols:
+  - meds_dexmedetomidine
+  - meds_ephedrine
+  - meds_esmolol
+  - meds_etomidate
+  - meds_epinephrine
+  - meds_fentanyl
+  - meds_glycopyrrolate
+  - meds_hydromorphone
+  - meds_ketamine
+  - meds_labetalol
+  - meds_norepinephrine
+  - meds_phenylephrine
+  - meds_propofol
+  - meds_remifentanil
+  - meds_vasopressin
+
+bolus_cols:
+  - meds_dexmedetomidine_bolus
+  - meds_ephedrine_bolus
+  - meds_esmolol_bolus
+  - meds_etomidate_bolus
+  - meds_epinephrine_bolus
+  - meds_fentanyl_bolus
+  - meds_glycopyrrolate_bolus
+  - meds_hydromorphone_bolus
+  - meds_ketamine_bolus
+  - meds_labetalol_bolus
+  - meds_norepinephrine_bolus
+  - meds_phenylephrine_bolus
+  - meds_propofol_bolus
+  - meds_remifentanil_bolus
+  - meds_vasopressin_bolus
+
+# NEW: Anesthetic gas columns
+gas_cols:
+  - phys_desflurane_exp_%
+  - phys_isoflurane_exp_%
+  - phys_sevoflurane_exp_%
+  - phys_nitrous_exp_%
+
+# ---------------------------
+# 📊 STATIC FEATURES
+# ---------------------------
+static_categoricals: [sex]
+static_numericals: [age, weight]
+static_embed_dim: 16
+
+# ---------------------------
+# 🧠 MODEL ARCHITECTURE
+# ---------------------------
+max_len: 5   # 5 minutes lookback
+future_steps: 1
+bp_embed_dim: 128
+bp_nhead: 8
+bp_num_layers: 8
+bp_dim_ff: 256
+bp_dropout: 0.1
+pos_encoding_type: adaptive
+num_bolus_drugs: 15
+
+# ---------------------------
+# 🏋️‍♀️ TRAINING PARAMETERS
+# ---------------------------
+batch_size_bp: 2048
+epochs_bp: 3
+lr_bp: 0.0002
+wd_bp: 0.00005
+gradient_clip_val: 1.0
+pos_weight: 10.0  # Imbalance weight for BCE loss (~6% positive class)
+
+# ---------------------------
+# 🔁 DATA LOADING
+# ---------------------------
+stride: 1  # Sample every 1 minute (not 5)
+num_workers: 4
+pin_memory: true
+persistent_workers: true
+prefetch_factor: 4
