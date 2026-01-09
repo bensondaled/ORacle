@@ -77,7 +77,7 @@ pip install -r requirements.txt
 Simulated dataset included at `demo/demo_data.feather`:
 - 10 surgical cases
 - 1,089 total timepoints
-- Vital signs: MAP, SBP, DBP, HR, SpO2, EtCO2
+- Physiologic measurements: MAP, SBP, DBP, HR, SpO2, EtCO2
 - 15 medication channels
 - 4 anesthetic gas channels
 
