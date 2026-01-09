@@ -1,6 +1,6 @@
 # ORacle: Intraoperative Vital Sign Prediction and Hypotension Onset Detection
 
-Deep learning system for real-time prediction of vital signs during surgery, with focus on mean arterial pressure (MAP) forecasting and hypotension onset detection.
+Deep learning system for physiolgic measurements forecasting during surgery and hypotension onset detection.
 
 Code for Ghanem, Deverett, et al.
 
@@ -88,12 +88,6 @@ Simulated dataset included at `demo/demo_data.feather`:
 python demo/run_demo.py
 ```
 
-With trained checkpoint:
-
-```bash
-python demo/run_demo.py --checkpoint path/to/model.pt
-```
-
 ### Expected Output
 
 ```
@@ -113,22 +107,6 @@ Created 899 samples
 
 Initializing model...
 Model parameters: 1,150,181
-
-----------------------------------------------------------------------
-Running Inference
-----------------------------------------------------------------------
-
-Case DEMO_001:
-  Current vitals: MAP=74 mmHg, HR=74 bpm, SpO2=98%
-  Predicted MAP (next 15 min): [-0.2, -0.2, -0.2, -0.2, -0.2, ...]
-  Hypotension risk: 3.6%
-
-Case DEMO_002:
-  Current vitals: MAP=77 mmHg, HR=59 bpm, SpO2=98%
-  Predicted MAP (next 15 min): [-0.2, -0.2, -0.3, -0.3, -0.3, ...]
-  Hypotension risk: 3.4%
-
-...
 
 ======================================================================
 Demo completed successfully!
@@ -180,6 +158,3 @@ See `demo/run_demo.py` for a complete example of loading data, initializing the 
 
 - **MAP Prediction**: 15-step ahead trajectory of mean arterial pressure
 - **Hypotension Risk**: Probability of hypotension onset (MAP < 65 mmHg)
-
----
-```

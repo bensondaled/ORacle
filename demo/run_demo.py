@@ -145,12 +145,6 @@ def main():
             else:
                 model.load_state_dict(state)
             print("Checkpoint loaded successfully!")
-        else:
-            print(f"Warning: Checkpoint not found at {checkpoint_path}")
-            print("Running with randomly initialized weights (demo mode)")
-    else:
-        print("No checkpoint provided - running with randomly initialized weights")
-        print("(For actual predictions, provide a trained checkpoint)")
     
     model.to(device)
     model.eval()
@@ -159,97 +153,9 @@ def main():
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {n_params:,}")
     print()
-
-    # Run inference on samples
-    print("-" * 70)
-    print("Running Inference")
-    print("-" * 70)
-    print()
-
-    # Sample a few cases for demo
-    case_ids = df['mpog_case_id'].unique()
-    results = []
-
-    for case_id in case_ids[:5]:  # Demo on first 5 cases
-        # Find samples for this case
-        case_samples = [i for i, (cid, _) in enumerate(dataset.samples) if cid == case_id]
-        
-        if not case_samples:
-            continue
-            
-        # Use the last sample (most recent state)
-        sample_idx = case_samples[-1]
-        batch = prepare_batch(dataset, [sample_idx], device)
-        
-        # Run inference
-        preds, hypo_fused_logits, hypo_bp_logits = run_inference(model, batch, config, device)
-        
-        # Get predictions
-        map_predictions = preds[0, :, 0].cpu().numpy()  # [T] - MAP predictions
-        
-        # Get hypotension risk
-        if hypo_fused_logits is not None:
-            hypo_prob = torch.sigmoid(hypo_fused_logits[0, 0]).item() * 100
-        else:
-            hypo_prob = 0.0
-            
-        # Get input vitals
-        last_vitals = batch['vitals'][0, -1, :].cpu().numpy()
-        vital_cols = config['vital_cols']
-        map_idx = vital_cols.index('phys_bp_mean_non_invasive')
-        hr_idx = vital_cols.index('phys_spo2_pulse_rate')
-        spo2_idx = vital_cols.index('phys_spo2_%')
-        
-        current_map = last_vitals[map_idx]
-        current_hr = last_vitals[hr_idx]
-        current_spo2 = last_vitals[spo2_idx]
-        
-        # Ground truth
-        gt_hypo = batch['hypo_onset_label'][0].item()
-        
-        print(f"Case {case_id}:")
-        print(f"  Current vitals: MAP={current_map:.0f} mmHg, HR={current_hr:.0f} bpm, SpO2={current_spo2:.0f}%")
-        print(f"  Predicted MAP (next {config['future_steps']} min): ", end="")
-        print(f"[{', '.join([f'{x:.1f}' for x in map_predictions[:5]])}, ...]")
-        print(f"  Hypotension risk: {hypo_prob:.1f}%", end="")
-        if hypo_prob > 50:
-            print(" *** HIGH RISK ***", end="")
-        print()
-        if gt_hypo > 0:
-            print(f"  [Ground truth: Hypotension onset at this timepoint]")
-        print()
-        
-        results.append({
-            'case_id': case_id,
-            'current_map': current_map,
-            'current_hr': current_hr,
-            'predicted_map_1min': map_predictions[0],
-            'predicted_map_5min': map_predictions[4] if len(map_predictions) > 4 else map_predictions[-1],
-            'predicted_map_15min': map_predictions[-1],
-            'hypo_risk_pct': hypo_prob,
-            'gt_hypo_onset': gt_hypo
-        })
-
-    # Save results
-    results_df = pd.DataFrame(results)
-    results_path = PROJECT_ROOT / 'demo' / 'demo_results.csv'
-    results_df.to_csv(results_path, index=False)
-    
-    print("-" * 70)
-    print("Summary")
-    print("-" * 70)
-    print(f"Processed {len(results)} cases")
-    print(f"Results saved to: {results_path}")
-    print()
     print("=" * 70)
     print("Demo completed successfully!")
     print("=" * 70)
-    
-    if not args.checkpoint:
-        print()
-        print("Note: Predictions were made with randomly initialized weights.")
-        print("For meaningful predictions, train a model or provide a checkpoint:")
-        print("  python demo/run_demo.py --checkpoint path/to/trained_model.pt")
 
     return 0
 
