@@ -72,7 +72,12 @@ gas_cols:
 bolus_cols: []
 
 target_cols:
+  - phys_bp_sys_non_invasive
+  - phys_bp_dias_non_invasive
   - phys_bp_mean_non_invasive
+  - phys_spo2_pulse_rate
+  - phys_spo2_%
+  - phys_end_tidal_co2_(mmhg)
 
 # ============================================
 # Static Features
@@ -86,10 +91,10 @@ static_numericals:
 vocabs: {}
 
 # ============================================
-# Hypotension Detection
+# Hypotension Detection (disabled for demo)
 # ============================================
-use_hypo_onset_fused: true
-use_hypo_onset_bp: true
+use_hypo_onset_fused: false
+use_hypo_onset_bp: false
 hypo_positive_rate: 0.043
 hypo_head_dropout: 0.3
 

@@ -23,10 +23,8 @@ sys.path.insert(0, str(PROJECT_ROOT / "transformer_model" / "autoreg"))
 
 import argparse
 import yaml
-import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
 
 # Import model components
 from transformer_model.autoreg.model import IntraOpPredictor
@@ -83,8 +81,8 @@ def run_inference(model, batch, config, device):
 
 def main():
     parser = argparse.ArgumentParser(description='ORacle Demo')
-    parser.add_argument('--checkpoint', type=str, default=None,
-                        help='Path to trained model checkpoint (optional)')
+    parser.add_argument('--checkpoint', type=str, default='demo/demo_checkpoint.pt',
+                        help='Path to trained model checkpoint')
     parser.add_argument('--config', type=str, default='demo/config.yaml',
                         help='Path to config file')
     parser.add_argument('--data', type=str, default='demo/demo_data.feather',
@@ -134,17 +132,18 @@ def main():
     print("Initializing model...")
     model = IntraOpPredictor(config)
     
-    # Load checkpoint if provided
-    if args.checkpoint:
-        checkpoint_path = Path(args.checkpoint)
-        if checkpoint_path.exists():
-            print(f"Loading checkpoint from {checkpoint_path}...")
-            state = torch.load(checkpoint_path, map_location=device)
-            if 'model_state' in state:
-                model.load_state_dict(state['model_state'])
-            else:
-                model.load_state_dict(state)
-            print("Checkpoint loaded successfully!")
+    # Load checkpoint
+    checkpoint_path = PROJECT_ROOT / args.checkpoint
+    if checkpoint_path.exists():
+        print(f"Loading checkpoint from {checkpoint_path}...")
+        state = torch.load(checkpoint_path, map_location=device, weights_only=True)
+        if 'model_state' in state:
+            model.load_state_dict(state['model_state'])
+        else:
+            model.load_state_dict(state)
+        print("Checkpoint loaded successfully!")
+    else:
+        print(f"Warning: Checkpoint not found at {checkpoint_path}")
     
     model.to(device)
     model.eval()

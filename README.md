@@ -1,6 +1,6 @@
-# ORacle: Intraoperative Vital Sign Prediction and Hypotension Onset Detection
+# ORacle: Intraoperative Vital Sign Prediction
 
-Deep learning system for physiolgic measurements forecasting during surgery and hypotension onset detection.
+Deep learning system for physiologic measurements forecasting during surgery.
 
 Code for Ghanem, Deverett, et al.
 
@@ -61,7 +61,7 @@ poetry shell
 python -m venv oracle_env
 source oracle_env/bin/activate
 
-# Install PyTorch with CUDA
+# Install PyTorch with CUDAa
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
 
 # Install remaining dependencies
@@ -80,7 +80,6 @@ Simulated dataset included at `demo/demo_data.feather`:
 - Vital signs: MAP, SBP, DBP, HR, SpO2, EtCO2
 - 15 medication channels
 - 4 anesthetic gas channels
-- 5 hypotension onset events
 
 ### Run Demo
 
@@ -106,14 +105,14 @@ Creating dataset...
 Created 899 samples
 
 Initializing model...
-Model parameters: 1,150,181
+Loading checkpoint from demo/demo_checkpoint.pt...
+Checkpoint loaded successfully!
+Model parameters: 1,150,504
 
 ======================================================================
 Demo completed successfully!
 ======================================================================
 ```
-
-Note: Output shown is with randomly initialized weights. Use a trained checkpoint for meaningful predictions.
 
 ---
 
@@ -156,5 +155,4 @@ See `demo/run_demo.py` for a complete example of loading data, initializing the 
 
 ## Model Output
 
-- **MAP Prediction**: 15-step ahead trajectory of mean arterial pressure
-- **Hypotension Risk**: Probability of hypotension onset (MAP < 65 mmHg)
+- **Physiologic Predictions**: 15-step ahead trajectory of 6 physiologic measurements (SBP, DBP, MAP, HR, SpO2, EtCO2)
