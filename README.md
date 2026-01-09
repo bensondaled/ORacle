@@ -1,4 +1,4 @@
-# ORacle: Intraoperative Vital Sign Prediction
+# ORacle: Intaoperative Physiologic Trajectory Forecasting
 
 Deep learning system for physiologic measurements forecasting during surgery.
 
