@@ -1,0 +1,34 @@
+# ORacle - Intraoperative Vital Sign Prediction
+# Core dependencies
+
+# Deep learning
+torch>=2.0.0
+# Note: Install PyTorch separately with appropriate CUDA version
+# See: https://pytorch.org/get-started/locally/
+
+# Data processing
+numpy>=1.21.0
+pandas>=1.4.0
+pyarrow>=10.0.0
+tables>=3.7.0
+
+# Machine learning utilities
+scikit-learn>=1.0.0
+
+# Visualization
+matplotlib>=3.5.0
+
+# Configuration
+pyyaml>=6.0
+
+# Text processing
+unidecode>=1.3.0
+
+# Optional: XGBoost baseline
+xgboost>=1.7.0
+
+# Optional: Experiment tracking
+# wandb>=0.13.0
+
+# Optional: CUDA-accelerated ML (requires RAPIDS)
+# cuml>=23.0

@@ -1,0 +1,107 @@
+# ORacle Demo Configuration
+# Configuration for running the model on the demo dataset
+
+# ============================================
+# Model Architecture
+# ============================================
+
+# Encoder dimensions
+bp_embed_dim: 128
+bp_nhead: 4
+bp_dim_ff: 256
+bp_dropout: 0.1
+bp_num_layers: 2
+
+# Decoder
+decoder_type: "gru"
+dec_nhead: 4
+dec_layers: 2
+dec_dropout: 0.1
+
+# Positional encoding
+pos_encoding_type: "learned"
+
+# Static embedding
+static_embed_dim: 32
+static_combine_mode: "concat"
+patient_vocab_size: 1000
+
+# ============================================
+# Data Configuration
+# ============================================
+max_len: 60
+future_steps: 15
+stride: 1
+min_history_steps: 5
+patient_id_col: mpog_case_id
+
+# ============================================
+# Feature Columns
+# ============================================
+vital_cols:
+  - phys_bp_sys_non_invasive
+  - phys_bp_dias_non_invasive
+  - phys_bp_mean_non_invasive
+  - phys_spo2_pulse_rate
+  - phys_spo2_%
+  - phys_end_tidal_co2_(mmhg)
+
+med_cols:
+  - meds_propofol
+  - meds_fentanyl
+  - meds_phenylephrine
+  - meds_ketamine
+  - meds_norepinephrine
+  - meds_ephedrine
+  - meds_esmolol
+  - meds_vasopressin
+  - meds_remifentanil
+  - meds_dexmedetomidine
+  - meds_glycopyrrolate
+  - meds_labetalol
+  - meds_hydromorphone
+  - meds_etomidate
+  - meds_epinephrine
+
+gas_cols:
+  - phys_sevoflurane_exp_%
+  - phys_isoflurane_exp_%
+  - phys_desflurane_exp_%
+  - phys_nitrous_exp_%
+
+bolus_cols: []
+
+target_cols:
+  - phys_bp_mean_non_invasive
+
+# ============================================
+# Static Features
+# ============================================
+static_categoricals: []
+static_numericals:
+  - age
+  - sex
+  - weight
+
+vocabs: {}
+
+# ============================================
+# Hypotension Detection
+# ============================================
+use_hypo_onset_fused: true
+use_hypo_onset_bp: true
+hypo_positive_rate: 0.043
+hypo_head_dropout: 0.3
+
+# ============================================
+# VAE (disabled for demo)
+# ============================================
+use_vae: false
+
+# ============================================
+# Training Parameters (for reference)
+# ============================================
+batch_size: 32
+learning_rate: 0.001
+epochs: 100
+use_compile: false
