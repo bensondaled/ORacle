@@ -178,6 +178,48 @@ vital_cols:
 - phys_isoflurane_exp_%
 - phys_sevoflurane_exp_%
 - phys_nitrous_exp_%
+
+# Flag columns indicating measured (True) vs imputed (False) values
+# Used to mask imputed values in both input and loss calculation
+vital_flag_cols:
+- phys_bp_sys_non_invasive_flag
+- phys_bp_dias_non_invasive_flag
+- phys_bp_mean_non_invasive_flag
+- phys_spo2_%_flag
+- phys_spo2_pulse_rate_flag
+- phys_end_tidal_co2_(mmhg)_flag
+
+# Target flag columns (subset of vital_flag_cols for the target columns)
+target_flag_cols:
+- phys_bp_sys_non_invasive_flag
+- phys_bp_dias_non_invasive_flag
+- phys_bp_mean_non_invasive_flag
+- phys_spo2_%_flag
+- phys_spo2_pulse_rate_flag
+- phys_end_tidal_co2_(mmhg)_flag
+
+# Whether to mask imputed values (set to 0 in input, exclude from loss)
+use_imputation_masking: true
+
 wandb_project: flexible_bp_autoreg
+wandb_entity: null  # Set to your wandb username/team if needed
+
+# Normalization settings
+normalization:
+  enabled: true
+  stats_file: null  # Path to normalization_stats.json (computed from data), or null for clinical defaults
+  method: minmax  # 'minmax' or 'zscore'
+  # Clinical fallback ranges (used if stats_file is null)
+  clinical_ranges:
+    phys_bp_sys_non_invasive: {min: 40, max: 200}
+    phys_bp_dias_non_invasive: {min: 20, max: 120}
+    phys_bp_mean_non_invasive: {min: 30, max: 150}
+    phys_spo2_%: {min: 70, max: 100}
+    phys_spo2_pulse_rate: {min: 20, max: 200}
+    phys_end_tidal_co2_(mmhg): {min: 10, max: 80}
+    phys_sevoflurane_exp_%: {min: 0, max: 8}
+    phys_isoflurane_exp_%: {min: 0, max: 4}
+    phys_desflurane_exp_%: {min: 0, max: 18}
+    phys_nitrous_exp_%: {min: 0, max: 80}
 wd_bp: 5.0e-05
 zero_hypo_head_bias: false

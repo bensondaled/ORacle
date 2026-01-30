@@ -2,11 +2,99 @@ import torch
 from torch.utils.data import Dataset
 import pandas as pd
 import numpy as np
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 import logging
 import random
+import json
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+class Normalizer:
+    """
+    Handles normalization and denormalization of features.
+
+    Supports:
+    - MinMax: (x - min) / (max - min) -> [0, 1]
+    - ZScore: (x - mean) / std -> ~N(0, 1)
+    """
+
+    def __init__(self, config: Dict[str, Any]):
+        self.enabled = config.get('normalization', {}).get('enabled', False)
+        self.method = config.get('normalization', {}).get('method', 'minmax')
+        self.stats = {}
+
+        if not self.enabled:
+            return
+
+        # Try to load stats from file
+        stats_file = config.get('normalization', {}).get('stats_file')
+        if stats_file and Path(stats_file).exists():
+            logger.info(f"Loading normalization stats from: {stats_file}")
+            with open(stats_file, 'r') as f:
+                self.stats = json.load(f)
+        else:
+            # Use clinical fallback ranges
+            logger.info("Using clinical fallback ranges for normalization")
+            clinical_ranges = config.get('normalization', {}).get('clinical_ranges', {})
+            for col, ranges in clinical_ranges.items():
+                self.stats[col] = {
+                    'min': ranges.get('min', 0),
+                    'max': ranges.get('max', 1),
+                    'mean': (ranges.get('min', 0) + ranges.get('max', 1)) / 2,
+                    'std': (ranges.get('max', 1) - ranges.get('min', 0)) / 4
+                }
+
+        logger.info(f"Normalization enabled: method={self.method}, columns={len(self.stats)}")
+
+    def normalize(self, values: np.ndarray, col_name: str) -> np.ndarray:
+        """Normalize values for a given column."""
+        if not self.enabled or col_name not in self.stats:
+            return values
+
+        s = self.stats[col_name]
+
+        if self.method == 'minmax':
+            denom = s['max'] - s['min']
+            if denom == 0:
+                denom = 1
+            return (values - s['min']) / denom
+        elif self.method == 'zscore':
+            if s['std'] == 0:
+                return values - s['mean']
+            return (values - s['mean']) / s['std']
+        else:
+            return values
+
+    def denormalize(self, values: np.ndarray, col_name: str) -> np.ndarray:
+        """Denormalize values back to original scale."""
+        if not self.enabled or col_name not in self.stats:
+            return values
+
+        s = self.stats[col_name]
+
+        if self.method == 'minmax':
+            return values * (s['max'] - s['min']) + s['min']
+        elif self.method == 'zscore':
+            return values * s['std'] + s['mean']
+        else:
+            return values
+
+    def normalize_df_columns(self, df: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
+        """Normalize specific columns in a DataFrame (in-place)."""
+        if not self.enabled:
+            return df
+
+        for col in columns:
+            if col in df.columns and col in self.stats:
+                df[col] = self.normalize(df[col].values, col)
+
+        return df
+
+    def get_stats(self, col_name: str) -> Optional[Dict[str, float]]:
+        """Get normalization stats for a column."""
+        return self.stats.get(col_name)
 
 class IntraOpDataset(Dataset):
     def __init__(
@@ -31,6 +119,14 @@ class IntraOpDataset(Dataset):
         self.static_num_cols = config.get('static_numericals', [])
         self.patient_id_col = config.get('patient_id_col', 'mpog_case_id') # Add this line
         self.target_cols = config.get('target_cols', ['phys_bp_mean_non_invasive'])
+
+        # Flag columns for imputation masking
+        self.vital_flag_cols = config.get('vital_flag_cols', [])
+        self.target_flag_cols = config.get('target_flag_cols', [])
+        self.use_imputation_masking = config.get('use_imputation_masking', False)
+
+        # Initialize normalizer
+        self.normalizer = Normalizer(config)
         self.vocab_maps = vocabs or {}
         self.split = split
         self.balance_hypo_finetune = balance_hypo_finetune
@@ -51,6 +147,23 @@ class IntraOpDataset(Dataset):
         missing = required_cols - set(self.df.columns)
         if missing:
             raise ValueError(f"Missing columns: {sorted(missing)}")
+
+        # Check for flag columns if imputation masking is enabled
+        if self.use_imputation_masking:
+            available_vital_flags = [c for c in self.vital_flag_cols if c in self.df.columns]
+            available_target_flags = [c for c in self.target_flag_cols if c in self.df.columns]
+            if available_vital_flags:
+                logger.info(f"Found {len(available_vital_flags)} vital flag columns for imputation masking")
+                self.vital_flag_cols = available_vital_flags
+            else:
+                logger.warning("No vital flag columns found, imputation masking disabled for inputs")
+                self.vital_flag_cols = []
+            if available_target_flags:
+                logger.info(f"Found {len(available_target_flags)} target flag columns for imputation masking")
+                self.target_flag_cols = available_target_flags
+            else:
+                logger.warning("No target flag columns found, imputation masking disabled for targets")
+                self.target_flag_cols = []
 
         # Process static categorical columns
         for col in self.static_cat_cols:
@@ -167,19 +280,47 @@ class IntraOpDataset(Dataset):
         bolus = np.zeros((self.max_len, len(self.bolus_cols)), dtype=np.float16) if self.bolus_cols else np.zeros((self.max_len, 0), dtype=np.float16)
         attention_mask = torch.zeros(self.max_len, dtype=torch.bool)
 
+        # Initialize vital flags (True = measured, False = imputed/masked)
+        # Default to True (all measured) if no flag columns available
+        vital_flags = np.ones((self.max_len, len(self.vital_flag_cols)), dtype=np.bool_) if self.vital_flag_cols else None
+
         # Fill arrays with actual data (right-aligned)
         if seq_len > 0:
             # DTYPE OPTIMIZED: Use float16 for input data
-            vitals[-seq_len:] = window[self.vital_cols].values.astype(np.float16)
+            vital_values = window[self.vital_cols].values.astype(np.float32)
+
+            # Apply normalization to vitals
+            if self.normalizer.enabled:
+                for i, col in enumerate(self.vital_cols):
+                    vital_values[:, i] = self.normalizer.normalize(vital_values[:, i], col)
+
+            vitals[-seq_len:] = vital_values.astype(np.float16)
             meds[-seq_len:] = window[self.med_cols].values.astype(np.float16)
-            
+
             if self.gas_cols:
                 gases[-seq_len:] = window[self.gas_cols].values.astype(np.float16)
-            
+
             if self.bolus_cols:
                 bolus[-seq_len:] = window[self.bolus_cols].values.astype(np.float16)
-            
+
             attention_mask[-seq_len:] = True
+
+            # Load vital flags and apply imputation masking
+            if self.use_imputation_masking and self.vital_flag_cols:
+                # Load flag values (True = measured, False = imputed)
+                flag_values = window[self.vital_flag_cols].values.astype(np.bool_)
+                vital_flags[-seq_len:] = flag_values
+
+                # Mask imputed values in vitals (set to 0 where flag is False)
+                # Only mask the columns that have corresponding flags
+                for i, flag_col in enumerate(self.vital_flag_cols):
+                    # Find the corresponding vital column
+                    vital_col = flag_col.replace('_flag', '')
+                    if vital_col in self.vital_cols:
+                        vital_idx = self.vital_cols.index(vital_col)
+                        # Set imputed values to 0
+                        imputed_mask = ~flag_values[:, i]
+                        vitals[-seq_len:, vital_idx][imputed_mask] = 0.0
 
         # Get bolus values from the current timestep (last row in window)
         bolus_values = np.zeros(len(self.bolus_cols), dtype=np.float16)
@@ -191,15 +332,35 @@ class IntraOpDataset(Dataset):
         # DTYPE OPTIMIZED: Use float16 for targets (will be upcast to float32 during loss computation)
         if len(future) != self.future_steps:
             # Pad or truncate as needed
-            future_values = np.zeros((self.future_steps, len(self.target_cols)), dtype=np.float16)
+            future_values = np.zeros((self.future_steps, len(self.target_cols)), dtype=np.float32)
             actual_len = min(len(future), self.future_steps)
             if actual_len > 0:
-                future_values[:actual_len] = future[self.target_cols].iloc[:actual_len].values.astype(np.float16)
+                future_values[:actual_len] = future[self.target_cols].iloc[:actual_len].values.astype(np.float32)
             target_array = future_values
         else:
-            target_array = future[self.target_cols].values.astype(np.float16)
-            
+            target_array = future[self.target_cols].values.astype(np.float32)
+
+        # Apply normalization to targets
+        if self.normalizer.enabled:
+            for i, col in enumerate(self.target_cols):
+                target_array[:, i] = self.normalizer.normalize(target_array[:, i], col)
+
         target = torch.tensor(np.nan_to_num(target_array, nan=0.0), dtype=torch.float32)
+
+        # Initialize target flags (True = measured, False = imputed/masked)
+        # Default to True (all measured) if no flag columns available
+        target_flags = np.ones((self.future_steps, len(self.target_flag_cols)), dtype=np.bool_) if self.target_flag_cols else None
+
+        # Load target flags for future timesteps
+        if self.use_imputation_masking and self.target_flag_cols:
+            if len(future) != self.future_steps:
+                # Pad flags with False (treat as imputed) for padded timesteps
+                target_flags = np.zeros((self.future_steps, len(self.target_flag_cols)), dtype=np.bool_)
+                actual_len = min(len(future), self.future_steps)
+                if actual_len > 0:
+                    target_flags[:actual_len] = future[self.target_flag_cols].iloc[:actual_len].values.astype(np.bool_)
+            else:
+                target_flags = future[self.target_flag_cols].values.astype(np.bool_)
 
         # Static features from current timestep
         current_row_idx = end - 1
@@ -259,7 +420,7 @@ class IntraOpDataset(Dataset):
         # DTYPE OPTIMIZED: Create float16 tensors for memory efficiency (autocast will handle precision)
         result = {
             'vitals': torch.from_numpy(vitals),  # float16
-            'meds': torch.from_numpy(meds),     # float16  
+            'meds': torch.from_numpy(meds),     # float16
             'gases': torch.from_numpy(gases),   # float16
             'bolus': torch.from_numpy(bolus),   # float16
             'last_input_bolus': torch.from_numpy(bolus_values),  # float16
@@ -278,24 +439,58 @@ class IntraOpDataset(Dataset):
             'actual_sequence_length': torch.tensor(seq_len, dtype=torch.long),
             'prediction_timestep': torch.tensor(end, dtype=torch.long),
         }
-        
+
+        # Add flag tensors for imputation masking (True = measured, False = imputed)
+        if vital_flags is not None:
+            result['vital_flags'] = torch.from_numpy(vital_flags)  # [max_len, num_flag_cols]
+        if target_flags is not None:
+            result['target_flags'] = torch.from_numpy(target_flags)  # [future_steps, num_flag_cols]
+
         return result
 
     def __len__(self) -> int:
         return len(self.samples)
 
+    def denormalize_predictions(self, preds: torch.Tensor) -> torch.Tensor:
+        """
+        Denormalize model predictions back to original scale.
+
+        Args:
+            preds: Predictions [B, T, N] or [B, T] where N is number of target columns
+
+        Returns:
+            Denormalized predictions in original units (e.g., mmHg for BP)
+        """
+        if not self.normalizer.enabled:
+            return preds
+
+        preds_np = preds.cpu().numpy()
+        result = np.zeros_like(preds_np)
+
+        if preds_np.ndim == 2:
+            # Single target [B, T]
+            col = self.target_cols[0]
+            result = self.normalizer.denormalize(preds_np, col)
+        else:
+            # Multi-target [B, T, N]
+            for i, col in enumerate(self.target_cols):
+                if i < preds_np.shape[-1]:
+                    result[..., i] = self.normalizer.denormalize(preds_np[..., i], col)
+
+        return torch.tensor(result, dtype=preds.dtype, device=preds.device)
+
     @staticmethod
     def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         result = {}
         keys = batch[0].keys()
-        
+
         for key in keys:
             if key == "static_cat":
                 # Handle static categorical features
                 result[key] = {}
                 for cat_key in batch[0][key].keys():
                     result[key][cat_key] = torch.stack([item[key][cat_key] for item in batch])
-                    
+
             elif key == "static_num":
                 # Handle static numerical features
                 static_nums = [item[key] for item in batch if item[key] is not None]
@@ -303,13 +498,20 @@ class IntraOpDataset(Dataset):
                     result[key] = torch.stack(static_nums)
                 else:
                     result[key] = None
-                    
+
             elif key in ["hypo_onset_type", "mpog_case_id", "patient_id"]:
                 # Keep as lists for string values
                 result[key] = [item[key] for item in batch]
-                
+
+            elif key in ["vital_flags", "target_flags"]:
+                # Handle optional flag tensors - only include if present in all items
+                if all(key in item for item in batch):
+                    result[key] = torch.stack([item[key] for item in batch])
+                else:
+                    result[key] = None
+
             else:
                 # Stack tensor values
                 result[key] = torch.stack([item[key] for item in batch])
-                
+
         return result

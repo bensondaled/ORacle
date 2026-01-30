@@ -143,17 +143,34 @@ def train_autoreg_epoch(
                 else:
                     # SIMPLIFIED: Use last_input_bolus directly for drug weighting
                     trigger_mask = (batch["last_input_bolus"] > 0).any(dim=-1)
-                    
+
+                    # Get target flags for imputation masking (if available)
+                    target_flags = batch.get("target_flags")
+                    if target_flags is not None:
+                        target_flags = target_flags.to(device=device, dtype=torch.bool, non_blocking=True)
+
                     l, m = compute_bolus_conditional_loss(
                         preds=preds,
                         targets=batch["target"],
                         loss_weights=lw,
                         config=config,
                         bolus_trigger_mask=trigger_mask,
-                        last_input_bolus=batch["last_input_bolus"]  # Use this directly
+                        last_input_bolus=batch["last_input_bolus"],  # Use this directly
+                        target_flags=target_flags  # Pass imputation mask
                     )
+
+                    # Log imputation masking statistics (only occasionally to avoid overhead)
+                    if target_flags is not None and batch_idx % log_every == 0:
+                        total_values = target_flags.numel()
+                        measured_values = target_flags.sum().item()
+                        imputed_ratio = 1.0 - (measured_values / total_values) if total_values > 0 else 0.0
+                        m['imputation/target_imputed_ratio'] = imputed_ratio
+                        m['imputation/target_measured_count'] = measured_values
+
                     # Clean up
                     del trigger_mask
+                    if target_flags is not None:
+                        del target_flags
                     
                 loss = loss + l
                 # FIXED: Filter out non-numeric metrics (like drug names)

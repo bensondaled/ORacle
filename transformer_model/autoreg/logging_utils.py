@@ -47,8 +47,16 @@ def init_run(config):
         print(f"🔄 Initializing wandb run: {run_name}")
         print(f"🔄 wandb module: {wandb}")
         print(f"🔄 wandb.init available: {hasattr(wandb, 'init')}")
-        
-        wandb.init(project=config['wandb_project'], name=run_name, config=config)
+
+        # Get optional entity from config
+        wandb_entity = config.get('wandb_entity', None)
+
+        wandb.init(
+            project=config['wandb_project'],
+            entity=wandb_entity,
+            name=run_name,
+            config=config
+        )
 
         # ✅ Define metrics only after wandb.init()
         wandb.define_metric("global_step")

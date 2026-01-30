@@ -42,10 +42,44 @@ try:
 except Exception:
     SUPPORTED_LOSS_KEYS = SUPPORTED_LOSS_KEYS_DEFAULT
 
-def mse_loss(preds, targets, sample_weights=None):
+def mse_loss(preds, targets, sample_weights=None, target_flags=None):
+    """
+    MSE loss with optional imputation masking.
+
+    Args:
+        preds: Predictions [B, T] or [B, T, N]
+        targets: Targets [B, T] or [B, T, N]
+        sample_weights: Optional per-sample weights [B]
+        target_flags: Optional mask [B, T, N] where True = measured (include in loss),
+                     False = imputed (exclude from loss)
+    """
     loss = (preds - targets) ** 2
+
+    if target_flags is not None:
+        # Expand flags to match preds/targets shape if needed
+        if target_flags.dim() == 2 and preds.dim() == 3:
+            # target_flags is [B, T], preds is [B, T, N] - expand
+            target_flags = target_flags.unsqueeze(-1).expand_as(preds)
+        elif target_flags.dim() == 3 and preds.dim() == 2:
+            # target_flags is [B, T, N], preds is [B, T] - this shouldn't happen
+            pass
+
+        # Mask out imputed values (set their contribution to 0)
+        loss = loss * target_flags.float()
+
+        # Count valid (measured) values for proper averaging
+        valid_count = target_flags.float().sum()
+        if valid_count > 0:
+            if sample_weights is not None:
+                # Apply sample weights only to valid values
+                weighted_loss = loss * sample_weights.view(-1, 1, 1) if loss.dim() == 3 else loss * sample_weights.view(-1, 1)
+                return weighted_loss.sum() / valid_count
+            return loss.sum() / valid_count
+        else:
+            return torch.tensor(0.0, device=preds.device)
+
     if sample_weights is not None:
-        loss = loss * sample_weights.view(-1, 1, 1)
+        loss = loss * sample_weights.view(-1, 1, 1) if loss.dim() == 3 else loss * sample_weights.view(-1, 1)
     return loss.mean()
 
 def weighted_mse_loss(preds, targets, weight_factor=10.0):
@@ -117,7 +151,7 @@ def contrastive_bolus_loss(preds: torch.Tensor, bolus_trigger_mask: torch.Tensor
 #     pass
 
 
-def dilate_loss(preds, targets, alpha=0.5, gamma=0.01):
+def dilate_loss(preds, targets, alpha=0.5, gamma=0.01, target_flags=None):
     """
     FAST DILATE approximation - captures shape and temporal alignment efficiently.
     Args:
@@ -125,17 +159,46 @@ def dilate_loss(preds, targets, alpha=0.5, gamma=0.01):
         targets: [B, T, N] targets
         alpha: weight for shape vs temporal loss
         gamma: smoothing parameter (unused in fast version)
+        target_flags: Optional [B, T, N] mask where True = measured (include in loss)
     """
-    # SHAPE LOSS: Use simple L2 distance to capture sequence similarity
-    # This approximates the DTW shape matching without expensive DP
-    shape_loss = F.mse_loss(preds, targets)
-    
-    # TEMPORAL LOSS: Penalize temporal misalignment using difference of differences
-    # This captures the temporal structure without expensive DTW path computation
-    pred_diffs = torch.diff(preds, dim=1)  # [B, T-1, N]
-    target_diffs = torch.diff(targets, dim=1)  # [B, T-1, N]
-    temporal_loss = F.mse_loss(pred_diffs, target_diffs)
-    
+    if target_flags is not None:
+        # Expand flags to match shape if needed
+        if target_flags.dim() == 2 and preds.dim() == 3:
+            target_flags = target_flags.unsqueeze(-1).expand_as(preds)
+
+        # SHAPE LOSS with masking
+        shape_diff = (preds - targets) ** 2
+        shape_diff = shape_diff * target_flags.float()
+        valid_count = target_flags.float().sum()
+        if valid_count > 0:
+            shape_loss = shape_diff.sum() / valid_count
+        else:
+            shape_loss = torch.tensor(0.0, device=preds.device)
+
+        # TEMPORAL LOSS with masking
+        pred_diffs = torch.diff(preds, dim=1)  # [B, T-1, N]
+        target_diffs = torch.diff(targets, dim=1)  # [B, T-1, N]
+        # For temporal loss, we need both consecutive timesteps to be valid
+        # Use the intersection of flags for consecutive timesteps
+        temporal_flags = target_flags[:, :-1, :] & target_flags[:, 1:, :]
+        temporal_diff = (pred_diffs - target_diffs) ** 2
+        temporal_diff = temporal_diff * temporal_flags.float()
+        temporal_valid_count = temporal_flags.float().sum()
+        if temporal_valid_count > 0:
+            temporal_loss = temporal_diff.sum() / temporal_valid_count
+        else:
+            temporal_loss = torch.tensor(0.0, device=preds.device)
+    else:
+        # SHAPE LOSS: Use simple L2 distance to capture sequence similarity
+        # This approximates the DTW shape matching without expensive DP
+        shape_loss = F.mse_loss(preds, targets)
+
+        # TEMPORAL LOSS: Penalize temporal misalignment using difference of differences
+        # This captures the temporal structure without expensive DTW path computation
+        pred_diffs = torch.diff(preds, dim=1)  # [B, T-1, N]
+        target_diffs = torch.diff(targets, dim=1)  # [B, T-1, N]
+        temporal_loss = F.mse_loss(pred_diffs, target_diffs)
+
     dilate_total = alpha * shape_loss + (1 - alpha) * temporal_loss
     return dilate_total, shape_loss, temporal_loss
 
@@ -159,10 +222,11 @@ def corr_loss(preds: torch.Tensor, targets: torch.Tensor, eps: float = 1e-6) -> 
 def compute_bolus_conditional_loss(preds, targets, loss_weights, config=None,
                                   bolus_trigger_mask: Optional[torch.Tensor] = None,
                                   last_input_bolus: Optional[torch.Tensor] = None,
-                                  return_individual_losses: bool = False):
+                                  return_individual_losses: bool = False,
+                                  target_flags: Optional[torch.Tensor] = None):
     """
     SIMPLIFIED drug-specific bolus-conditional weighting using last_input_bolus directly.
-    
+
     Args:
         preds: [B, T, N] or [B, T] predictions
         targets: [B, T, N] or [B, T] targets
@@ -171,6 +235,8 @@ def compute_bolus_conditional_loss(preds, targets, loss_weights, config=None,
         bolus_trigger_mask: [B] boolean mask indicating bolus at last input
         last_input_bolus: [B, num_drugs] tensor with bolus amounts for each drug
         return_individual_losses: Whether to return individual loss tensors
+        target_flags: Optional [B, T, N] or [B, T] mask where True = measured (include in loss),
+                     False = imputed (exclude from loss)
     """
     
     if preds.dim() == 3 and preds.shape[-1] == 1:
@@ -219,14 +285,14 @@ def compute_bolus_conditional_loss(preds, targets, loss_weights, config=None,
     # === MSE LOSS ===
     if loss_weights.get("mse", 0) > 0:
         base_mse_weight = loss_weights["mse"]
-        
+
         if has_bolus and sample_multipliers is not None:
             # SIMPLIFIED: Apply averaged drug-specific weight to batch MSE
             sample_weights = sample_multipliers['mse']  # [B] tensor
             avg_weight_multiplier = sample_weights.mean().item()
-            
-            # Compute MSE for entire batch (more memory efficient)
-            mse = mse_loss(preds, targets)
+
+            # Compute MSE for entire batch (more memory efficient) with imputation masking
+            mse = mse_loss(preds, targets, target_flags=target_flags)
             mse_contribution = base_mse_weight * avg_weight_multiplier * mse
             
             total_loss += mse_contribution
@@ -244,39 +310,41 @@ def compute_bolus_conditional_loss(preds, targets, loss_weights, config=None,
                 
         elif has_bolus:
             # Fallback to simple bolus/non-bolus weighting
-            mse = mse_loss(preds, targets)
+            mse = mse_loss(preds, targets, target_flags=target_flags)
             bolus_multiplier = base_multipliers.get('mse', 1.0)
-            
+
             bolus_indices = bolus_trigger_mask
             non_bolus_indices = ~bolus_trigger_mask
-            
+
             if bolus_indices.any():
-                bolus_mse = mse_loss(preds[bolus_indices], targets[bolus_indices])
+                bolus_target_flags = target_flags[bolus_indices] if target_flags is not None else None
+                bolus_mse = mse_loss(preds[bolus_indices], targets[bolus_indices], target_flags=bolus_target_flags)
                 bolus_contribution = base_mse_weight * bolus_multiplier * bolus_mse
                 total_loss += bolus_contribution
-                
+
                 if return_individual_losses:
                     individual_losses['mse_bolus'] = bolus_contribution
-            
+
             if non_bolus_indices.any():
-                non_bolus_mse = mse_loss(preds[non_bolus_indices], targets[non_bolus_indices])
+                non_bolus_target_flags = target_flags[non_bolus_indices] if target_flags is not None else None
+                non_bolus_mse = mse_loss(preds[non_bolus_indices], targets[non_bolus_indices], target_flags=non_bolus_target_flags)
                 non_bolus_contribution = base_mse_weight * non_bolus_mse
                 total_loss += non_bolus_contribution
-                
+
                 if return_individual_losses:
                     individual_losses['mse_non_bolus'] = non_bolus_contribution
-            
+
             bolus_ratio = bolus_indices.sum().float() / len(bolus_indices)
             effective_weight = base_mse_weight * (1 + (bolus_multiplier - 1) * bolus_ratio)
             metrics['mse'] = mse.item()
             metrics['mse_effective_weight'] = effective_weight.item()
         else:
             # No bolus cases, use standard weighting
-            mse = mse_loss(preds, targets)
+            mse = mse_loss(preds, targets, target_flags=target_flags)
             mse_contribution = base_mse_weight * mse
             total_loss += mse_contribution
             metrics['mse'] = mse.item()
-            
+
             if return_individual_losses:
                 individual_losses['mse'] = mse_contribution
     
@@ -286,32 +354,35 @@ def compute_bolus_conditional_loss(preds, targets, loss_weights, config=None,
         if preds.dim() == 2:  # [B, T] -> [B, T, 1]
             dilate_preds = preds.unsqueeze(-1)
             dilate_targets = targets.unsqueeze(-1)
+            dilate_target_flags = target_flags.unsqueeze(-1) if target_flags is not None and target_flags.dim() == 2 else target_flags
         else:  # Already [B, T, N]
             dilate_preds = preds
             dilate_targets = targets
-            
+            dilate_target_flags = target_flags
+
         base_dilate_weight = loss_weights["dilate"]
-        
+
         if has_bolus and sample_multipliers is not None:
             # MEMORY-EFFICIENT DRUG-SPECIFIC DILATE: Process in chunks
             sample_weights = sample_multipliers['dilate']  # [B] tensor
             batch_size = dilate_preds.shape[0]
             chunk_size = min(32, batch_size)  # Process max 32 samples at once
-            
+
             total_dilate_loss = 0.0
             total_shape_loss = 0.0
             total_temporal_loss = 0.0
             total_weighted_contrib = 0.0
-            
+
             # Process samples in chunks to control memory usage
             for i in range(0, batch_size, chunk_size):
                 end_idx = min(i + chunk_size, batch_size)
                 chunk_preds = dilate_preds[i:end_idx]
                 chunk_targets = dilate_targets[i:end_idx]
                 chunk_weights = sample_weights[i:end_idx]
-                
-                # Compute DILATE for this chunk
-                chunk_dilate, chunk_shape, chunk_temporal = dilate_loss(chunk_preds, chunk_targets)
+                chunk_flags = dilate_target_flags[i:end_idx] if dilate_target_flags is not None else None
+
+                # Compute DILATE for this chunk with imputation masking
+                chunk_dilate, chunk_shape, chunk_temporal = dilate_loss(chunk_preds, chunk_targets, target_flags=chunk_flags)
                 
                 # Weight by drug-specific multipliers
                 weighted_chunk_contrib = base_dilate_weight * chunk_weights.mean() * chunk_dilate
@@ -324,6 +395,8 @@ def compute_bolus_conditional_loss(preds, targets, loss_weights, config=None,
                 
                 # Clean up chunk tensors immediately
                 del chunk_preds, chunk_targets, chunk_weights, chunk_dilate, chunk_shape, chunk_temporal, weighted_chunk_contrib
+                if chunk_flags is not None:
+                    del chunk_flags
             
             # Average the accumulated losses
             avg_dilate = total_dilate_loss / batch_size
@@ -347,32 +420,34 @@ def compute_bolus_conditional_loss(preds, targets, loss_weights, config=None,
                 
         elif has_bolus:
             # Fallback to simple bolus/non-bolus weighting
-            dilate_total, shape_loss, temporal_loss = dilate_loss(dilate_preds, dilate_targets)
+            dilate_total, shape_loss, temporal_loss = dilate_loss(dilate_preds, dilate_targets, target_flags=dilate_target_flags)
             bolus_multiplier = base_multipliers.get('dilate', 1.0)
             bolus_indices = bolus_trigger_mask
             non_bolus_indices = ~bolus_trigger_mask
-            
+
             # Compute separate DILATE losses
             if bolus_indices.any():
+                bolus_flags = dilate_target_flags[bolus_indices] if dilate_target_flags is not None else None
                 bolus_dilate, bolus_shape, bolus_temporal = dilate_loss(
-                    dilate_preds[bolus_indices], dilate_targets[bolus_indices]
+                    dilate_preds[bolus_indices], dilate_targets[bolus_indices], target_flags=bolus_flags
                 )
                 bolus_contribution = base_dilate_weight * bolus_multiplier * bolus_dilate
                 total_loss += bolus_contribution
-                
+
                 if return_individual_losses:
                     individual_losses['dilate_bolus'] = bolus_contribution
-            
+
             if non_bolus_indices.any():
+                non_bolus_flags = dilate_target_flags[non_bolus_indices] if dilate_target_flags is not None else None
                 non_bolus_dilate, non_bolus_shape, non_bolus_temporal = dilate_loss(
-                    dilate_preds[non_bolus_indices], dilate_targets[non_bolus_indices]
+                    dilate_preds[non_bolus_indices], dilate_targets[non_bolus_indices], target_flags=non_bolus_flags
                 )
                 non_bolus_contribution = base_dilate_weight * non_bolus_dilate
                 total_loss += non_bolus_contribution
-                
+
                 if return_individual_losses:
                     individual_losses['dilate_non_bolus'] = non_bolus_contribution
-            
+
             # Logging metrics
             bolus_ratio = bolus_indices.sum().float() / len(bolus_indices)
             effective_weight = base_dilate_weight * (1 + (bolus_multiplier - 1) * bolus_ratio)
@@ -382,13 +457,13 @@ def compute_bolus_conditional_loss(preds, targets, loss_weights, config=None,
             metrics['temporal'] = temporal_loss.item()
         else:
             # No bolus cases
-            dilate_total, shape_loss, temporal_loss = dilate_loss(dilate_preds, dilate_targets)
+            dilate_total, shape_loss, temporal_loss = dilate_loss(dilate_preds, dilate_targets, target_flags=dilate_target_flags)
             dilate_contribution = base_dilate_weight * dilate_total
             total_loss += dilate_contribution
             metrics['dilate'] = dilate_total.item()
             metrics['shape'] = shape_loss.item()
             metrics['temporal'] = temporal_loss.item()
-            
+
             if return_individual_losses:
                 individual_losses['dilate'] = dilate_contribution
     
@@ -437,7 +512,8 @@ def compute_loss(preds, targets, loss_weights, bolus_mask=None, config=None,
                  onset_types: Optional[List[str]] = None,
                  group_mask: Dict[str, torch.Tensor] = None,
                  bolus_trigger_mask: Optional[torch.Tensor] = None,
-                 return_individual_losses: bool = False):
+                 return_individual_losses: bool = False,
+                 target_flags: Optional[torch.Tensor] = None):
 
     if preds.dim() == 3 and preds.shape[-1] == 1:
         preds = preds.squeeze(-1)
@@ -463,7 +539,7 @@ def compute_loss(preds, targets, loss_weights, bolus_mask=None, config=None,
         mse = (mse.mean(dim=1) * sample_weights.view(-1, 1)).mean()
 
 
-    mse = mse_loss(preds, targets, sample_weights)
+    mse = mse_loss(preds, targets, sample_weights, target_flags=target_flags)
     total_loss += loss_weights.get("mse", 1.0) * mse
     metrics['mse'] = mse.item()
 
@@ -498,7 +574,7 @@ def compute_loss(preds, targets, loss_weights, bolus_mask=None, config=None,
         metrics["contrastive_bolus"] = contrast_loss.item()
 
     if loss_weights.get("dilate", 0) > 0:
-        dilate_total, shape_loss, temporal_loss = dilate_loss(preds, targets)
+        dilate_total, shape_loss, temporal_loss = dilate_loss(preds, targets, target_flags=target_flags)
         total_loss += loss_weights["dilate"] * dilate_total
         metrics['dilate'] = dilate_total.item()
         metrics['shape'] = shape_loss.item()
