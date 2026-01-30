@@ -15,8 +15,8 @@ set -euo pipefail
 # Config
 # -----------------------------
 DATA_DIR="${DATA_DIR:-/nfs/turbo/umms-sachinkh/PCRC 247 Aghaeepour/output_all/pcrc247_20260121}"
-ORACLE_DIR="${ORACLE_DIR:-/home/marcgh/mpog/ORacle}"
-POETRY_DIR="${POETRY_DIR:-/home/marcgh/pcrc_0247_duckdb}"
+ORACLE_DIR="${ORACLE_DIR:-$HOME/ORacle}"
+POETRY_DIR="${POETRY_DIR:-$HOME/pcrc_0247_duckdb}"
 OUTPUT_FILE="${OUTPUT_FILE:-${ORACLE_DIR}/normalization_stats.json}"
 
 # -----------------------------
