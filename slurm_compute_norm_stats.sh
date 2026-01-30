@@ -4,7 +4,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=32G
+#SBATCH --mem=64G
 #SBATCH --time=4:00:00
 #SBATCH --output=/home/%u/logs/norm_stats_%j.log
 #SBATCH --error=/home/%u/logs/norm_stats_%j.err

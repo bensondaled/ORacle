@@ -64,7 +64,8 @@ def pass1_compute_minmax(files: List[Path], columns: List[str]) -> Dict[str, Dic
         print(f"[{i+1}/{len(files)}] Reading {file_path.name}...", end=" ", flush=True)
 
         try:
-            df = pd.read_feather(file_path)
+            # Only read the columns we need to save memory
+            df = pd.read_feather(file_path, columns=columns)
             rows = len(df)
 
             for col in columns:
@@ -75,6 +76,7 @@ def pass1_compute_minmax(files: List[Path], columns: List[str]) -> Dict[str, Dic
                     continue
                 running_min[col] = min(running_min[col], float(values.min()))
                 running_max[col] = max(running_max[col], float(values.max()))
+                del values
 
             print(f"{rows:,} rows")
 
@@ -134,10 +136,11 @@ def pass2_scale_and_save(
         print(f"[{i+1}/{len(files)}] Processing {file_path.name}...", end=" ", flush=True)
 
         try:
+            # Read full file for pass 2 (need all columns to save)
             df = pd.read_feather(file_path)
             rows = len(df)
 
-            # Apply min-max scaling to each column
+            # Apply min-max scaling to each column (in-place)
             for col in columns:
                 if col not in df.columns:
                     continue
@@ -149,7 +152,7 @@ def pass2_scale_and_save(
                 range_val = max_val - min_val
 
                 if range_val > 0:
-                    df[col] = (df[col] - min_val) / range_val
+                    df[col] = (df[col].values - min_val) / range_val
                 else:
                     df[col] = 0.0
 
