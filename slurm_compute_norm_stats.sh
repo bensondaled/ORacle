@@ -97,8 +97,9 @@ ${POETRY} run python -c "import pandas; import numpy; import tqdm; print('All pa
 
 echo ""
 echo "Listing feather files..."
-ls "${DATA_DIR}"/*.feather 2>/dev/null | wc -l | xargs -I {} echo "Found {} feather files"
-ls "${DATA_DIR}"/*.feather 2>/dev/null | head -5
+FEATHER_COUNT=$(ls "${DATA_DIR}"/*.feather 2>/dev/null | wc -l || echo "0")
+echo "Found ${FEATHER_COUNT} feather files"
+ls "${DATA_DIR}"/*.feather 2>/dev/null | head -5 || true
 
 echo ""
 echo "Running compute_normalization_stats.py..."
