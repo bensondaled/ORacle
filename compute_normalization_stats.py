@@ -49,8 +49,13 @@ def detect_columns_to_scale(files: List[Path]) -> List[str]:
     skipped_columns = []
 
     for col in df.columns:
-        # Skip non-numeric
-        if not np.issubdtype(df[col].dtype, np.number):
+        # Skip non-numeric (handle pandas extension dtypes)
+        try:
+            if not np.issubdtype(df[col].dtype, np.number):
+                skipped_columns.append(col)
+                continue
+        except TypeError:
+            # Pandas extension dtype (StringDtype, etc)
             skipped_columns.append(col)
             continue
 
