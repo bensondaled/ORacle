@@ -17,7 +17,8 @@ set -euo pipefail
 DATA_DIR="${DATA_DIR:-/nfs/turbo/umms-sachinkh/PCRC 247 Aghaeepour/output_all/pcrc247_20260121}"
 ORACLE_DIR="${ORACLE_DIR:-$HOME/ORacle}"
 POETRY_DIR="${POETRY_DIR:-$HOME/pcrc_0247_duckdb}"
-OUTPUT_FILE="${OUTPUT_FILE:-${ORACLE_DIR}/normalization_stats.json}"
+OUTPUT_DIR="${OUTPUT_DIR:-/nfs/turbo/umms-sachinkh/PCRC 247 Aghaeepour/output_all/pcrc247_20260121_scaled}"
+STATS_FILE="${STATS_FILE:-${ORACLE_DIR}/normalization_stats.json}"
 
 # -----------------------------
 # Environment
@@ -68,7 +69,8 @@ echo "Poetry:        ${POETRY}"
 echo "Poetry dir:    ${POETRY_DIR}"
 echo "Data dir:      ${DATA_DIR}"
 echo "Oracle dir:    ${ORACLE_DIR}"
-echo "Output file:   ${OUTPUT_FILE}"
+echo "Output dir:    ${OUTPUT_DIR}"
+echo "Stats file:    ${STATS_FILE}"
 echo "Start:         $(date)"
 echo "=============================================="
 
@@ -104,16 +106,20 @@ echo ""
 
 ${POETRY} run python -u "${ORACLE_DIR}/compute_normalization_stats.py" \
   --data-dir "${DATA_DIR}" \
-  --output "${OUTPUT_FILE}"
+  --output-dir "${OUTPUT_DIR}" \
+  --stats-file "${STATS_FILE}"
 
 echo ""
 echo "=============================================="
-echo "NORMALIZATION STATS COMPLETE"
+echo "NORMALIZATION AND SCALING COMPLETE"
 echo "End:           $(date)"
-echo "Output file:   ${OUTPUT_FILE}"
+echo "Stats file:    ${STATS_FILE}"
+echo "Scaled data:   ${OUTPUT_DIR}"
 echo "=============================================="
 
-# Display the results
-echo ""
-echo "Generated normalization stats:"
-cat "${OUTPUT_FILE}"
+# Display the stats
+if [ -f "${STATS_FILE}" ]; then
+  echo ""
+  echo "Generated normalization stats:"
+  cat "${STATS_FILE}"
+fi

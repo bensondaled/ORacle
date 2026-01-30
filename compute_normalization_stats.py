@@ -1,25 +1,22 @@
 #!/usr/bin/env python3
 """
-Compute normalization statistics (min/max) across all institution files.
+Compute normalization statistics and create scaled dataset.
 
-Efficient single-pass streaming approach:
-- Loads one feather file at a time
-- Tracks running min/max per feature
-- Saves to JSON for use during training
+Two-pass memory-efficient approach:
+  Pass 1: Stream through files one at a time to find global min/max
+  Pass 2: Apply scaling to each file and save scaled versions
 
 Usage:
-    python compute_normalization_stats.py --data-dir /path/to/institutions --output stats.json
-    python compute_normalization_stats.py --data-dir /path/to/institutions --train-institutions 1001,1002,1003
+    python compute_normalization_stats.py --data-dir /path/to/institutions --output-dir /path/to/scaled
 """
 
 import argparse
 import json
-import os
+import gc
 from pathlib import Path
 from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
-from tqdm import tqdm
 
 
 # Columns to normalize (vitals + targets)
@@ -40,206 +37,193 @@ NORMALIZE_COLS = [
     'phys_nitrous_exp_%',
 ]
 
-# Clinical fallback ranges (used if data is missing or has issues)
-CLINICAL_FALLBACKS = {
-    'phys_bp_sys_non_invasive': {'min': 40, 'max': 200},
-    'phys_bp_dias_non_invasive': {'min': 20, 'max': 120},
-    'phys_bp_mean_non_invasive': {'min': 30, 'max': 150},
-    'phys_spo2_%': {'min': 70, 'max': 100},
-    'phys_spo2_pulse_rate': {'min': 20, 'max': 200},
-    'phys_end_tidal_co2_(mmhg)': {'min': 10, 'max': 80},
-    'phys_sevoflurane_exp_%': {'min': 0, 'max': 8},
-    'phys_isoflurane_exp_%': {'min': 0, 'max': 4},
-    'phys_desflurane_exp_%': {'min': 0, 'max': 18},
-    'phys_nitrous_exp_%': {'min': 0, 'max': 80},
-}
 
-
-def find_institution_files(data_dir: str, pattern: str = "institution_*.feather") -> List[Path]:
+def find_institution_files(data_dir: str) -> List[Path]:
     """Find all institution feather files in directory."""
     data_path = Path(data_dir)
-    files = sorted(data_path.glob(pattern))
+    files = sorted(data_path.glob("institution_*.feather"))
     if not files:
-        # Try alternative patterns
         files = sorted(data_path.glob("*.feather"))
     return files
 
 
-def compute_stats_streaming(
-    data_dir: str,
-    institutions: Optional[List[int]] = None,
-    columns: Optional[List[str]] = None
-) -> Dict[str, Dict[str, float]]:
+def pass1_compute_minmax(files: List[Path], columns: List[str]) -> Dict[str, Dict[str, float]]:
     """
-    Compute min/max statistics by streaming through files.
+    Pass 1: Stream through all files to compute global min/max.
 
-    Memory efficient: loads one file at a time, tracks running stats.
-
-    Args:
-        data_dir: Directory containing institution feather files
-        institutions: Optional list of institution numbers to include (None = all)
-        columns: Columns to compute stats for (None = NORMALIZE_COLS)
-
-    Returns:
-        Dict mapping column name to {'min': float, 'max': float, 'mean': float, 'std': float}
+    Loads one file at a time to minimize memory usage.
     """
-    columns = columns or NORMALIZE_COLS
-    files = find_institution_files(data_dir)
+    print("=" * 60)
+    print("PASS 1: Computing global min/max statistics")
+    print("=" * 60)
 
-    if not files:
-        raise ValueError(f"No feather files found in {data_dir}")
-
-    print(f"Found {len(files)} institution files")
-
-    # Filter to specific institutions if requested
-    if institutions:
-        inst_set = set(institutions)
-        filtered_files = []
-        for f in files:
-            # Extract institution number from filename
-            try:
-                inst_num = int(f.stem.split('_')[-1])
-                if inst_num in inst_set:
-                    filtered_files.append(f)
-            except ValueError:
-                continue
-        files = filtered_files
-        print(f"Filtered to {len(files)} files for institutions: {institutions}")
-
-    # Initialize running statistics
     running_min = {col: np.inf for col in columns}
     running_max = {col: -np.inf for col in columns}
-    running_sum = {col: 0.0 for col in columns}
-    running_sum_sq = {col: 0.0 for col in columns}
-    running_count = {col: 0 for col in columns}
 
-    total_rows = 0
+    for i, file_path in enumerate(files):
+        print(f"[{i+1}/{len(files)}] Reading {file_path.name}...", end=" ", flush=True)
 
-    # Stream through files
-    for file_path in tqdm(files, desc="Computing stats"):
         try:
             df = pd.read_feather(file_path)
-            total_rows += len(df)
+            rows = len(df)
 
             for col in columns:
                 if col not in df.columns:
                     continue
-
-                # Get non-null values
                 values = df[col].dropna().values
                 if len(values) == 0:
                     continue
+                running_min[col] = min(running_min[col], float(values.min()))
+                running_max[col] = max(running_max[col], float(values.max()))
 
-                # Update running stats
-                running_min[col] = min(running_min[col], values.min())
-                running_max[col] = max(running_max[col], values.max())
-                running_sum[col] += values.sum()
-                running_sum_sq[col] += (values ** 2).sum()
-                running_count[col] += len(values)
+            print(f"{rows:,} rows")
 
-            # Free memory
+            # Free memory explicitly
             del df
+            gc.collect()
 
         except Exception as e:
-            print(f"Warning: Error reading {file_path}: {e}")
+            print(f"ERROR: {e}")
             continue
 
-    print(f"\nProcessed {total_rows:,} total rows across {len(files)} files")
-
-    # Compute final statistics
+    # Build stats dict
     stats = {}
+    print("\n" + "-" * 60)
+    print(f"{'Column':<40} {'Min':>10} {'Max':>10}")
+    print("-" * 60)
+
     for col in columns:
-        count = running_count[col]
+        min_val = running_min[col]
+        max_val = running_max[col]
 
-        if count == 0:
-            # Use clinical fallback
-            print(f"Warning: No data for {col}, using clinical fallback")
-            stats[col] = CLINICAL_FALLBACKS.get(col, {'min': 0, 'max': 1})
-            stats[col]['mean'] = (stats[col]['min'] + stats[col]['max']) / 2
-            stats[col]['std'] = (stats[col]['max'] - stats[col]['min']) / 4
-            stats[col]['count'] = 0
+        # Handle edge cases
+        if np.isinf(min_val) or np.isinf(max_val):
+            print(f"{col:<40} {'NO DATA':>10} {'NO DATA':>10}")
+            min_val, max_val = 0.0, 1.0
+        elif min_val == max_val:
+            print(f"{col:<40} {min_val:>10.2f} {max_val:>10.2f} (constant, expanding)")
+            min_val -= 1
+            max_val += 1
         else:
-            mean = running_sum[col] / count
-            variance = (running_sum_sq[col] / count) - (mean ** 2)
-            std = np.sqrt(max(0, variance))  # Ensure non-negative
+            print(f"{col:<40} {min_val:>10.2f} {max_val:>10.2f}")
 
-            stats[col] = {
-                'min': float(running_min[col]),
-                'max': float(running_max[col]),
-                'mean': float(mean),
-                'std': float(std),
-                'count': int(count)
-            }
+        stats[col] = {'min': min_val, 'max': max_val}
 
-            # Sanity check: if min == max, expand range slightly
-            if stats[col]['min'] == stats[col]['max']:
-                print(f"Warning: {col} has constant value {stats[col]['min']}, expanding range")
-                stats[col]['min'] -= 1
-                stats[col]['max'] += 1
-
+    print("-" * 60)
     return stats
 
 
-def print_stats_summary(stats: Dict[str, Dict[str, float]]):
-    """Print a nice summary of the statistics."""
-    print("\n" + "=" * 70)
-    print("NORMALIZATION STATISTICS SUMMARY")
-    print("=" * 70)
-    print(f"{'Column':<40} {'Min':>10} {'Max':>10} {'Mean':>10} {'Std':>10}")
-    print("-" * 70)
+def pass2_scale_and_save(
+    files: List[Path],
+    stats: Dict[str, Dict[str, float]],
+    columns: List[str],
+    output_dir: Path
+):
+    """
+    Pass 2: Apply min-max scaling to each file and save.
 
-    for col, s in stats.items():
-        print(f"{col:<40} {s['min']:>10.2f} {s['max']:>10.2f} {s['mean']:>10.2f} {s['std']:>10.2f}")
+    Loads one file at a time, scales, saves, frees memory.
+    """
+    print("\n" + "=" * 60)
+    print("PASS 2: Scaling and saving files")
+    print("=" * 60)
 
-    print("=" * 70)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
+    for i, file_path in enumerate(files):
+        print(f"[{i+1}/{len(files)}] Processing {file_path.name}...", end=" ", flush=True)
 
-def save_stats(stats: Dict[str, Dict[str, float]], output_path: str):
-    """Save statistics to JSON file."""
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            df = pd.read_feather(file_path)
+            rows = len(df)
 
-    with open(output_path, 'w') as f:
-        json.dump(stats, f, indent=2)
+            # Apply min-max scaling to each column
+            for col in columns:
+                if col not in df.columns:
+                    continue
+                if col not in stats:
+                    continue
 
-    print(f"\nSaved normalization stats to: {output_path}")
+                min_val = stats[col]['min']
+                max_val = stats[col]['max']
+                range_val = max_val - min_val
+
+                if range_val > 0:
+                    df[col] = (df[col] - min_val) / range_val
+                else:
+                    df[col] = 0.0
+
+            # Save scaled file
+            output_path = output_dir / file_path.name
+            df.to_feather(output_path)
+
+            print(f"{rows:,} rows -> {output_path.name}")
+
+            # Free memory
+            del df
+            gc.collect()
+
+        except Exception as e:
+            print(f"ERROR: {e}")
+            continue
+
+    print("-" * 60)
+    print(f"Scaled files saved to: {output_dir}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Compute normalization statistics across institution files')
-    parser.add_argument('--data-dir', type=str, required=True,
-                        help='Directory containing institution feather files')
-    parser.add_argument('--output', type=str, default='normalization_stats.json',
-                        help='Output JSON file path (default: normalization_stats.json)')
-    parser.add_argument('--train-institutions', type=str, default=None,
-                        help='Comma-separated list of institution numbers to use (default: all)')
-    parser.add_argument('--columns', type=str, default=None,
-                        help='Comma-separated list of columns to normalize (default: vital columns)')
+    parser = argparse.ArgumentParser(
+        description='Compute normalization stats and create scaled dataset'
+    )
+    parser.add_argument(
+        '--data-dir', type=str, required=True,
+        help='Directory containing institution feather files'
+    )
+    parser.add_argument(
+        '--output-dir', type=str, required=True,
+        help='Directory to save scaled feather files'
+    )
+    parser.add_argument(
+        '--stats-file', type=str, default=None,
+        help='Path to save/load normalization stats JSON (optional)'
+    )
+    parser.add_argument(
+        '--skip-scaling', action='store_true',
+        help='Only compute stats, skip pass 2 scaling'
+    )
 
     args = parser.parse_args()
 
-    # Parse institution list
-    institutions = None
-    if args.train_institutions:
-        institutions = [int(x.strip()) for x in args.train_institutions.split(',')]
+    # Find files
+    files = find_institution_files(args.data_dir)
+    if not files:
+        print(f"ERROR: No feather files found in {args.data_dir}")
+        return 1
 
-    # Parse columns
-    columns = None
-    if args.columns:
-        columns = [x.strip() for x in args.columns.split(',')]
+    print(f"Found {len(files)} institution files in {args.data_dir}")
+    print()
 
-    # Compute stats
-    print(f"Computing normalization statistics from: {args.data_dir}")
-    stats = compute_stats_streaming(args.data_dir, institutions, columns)
+    # Pass 1: Compute min/max
+    stats = pass1_compute_minmax(files, NORMALIZE_COLS)
 
-    # Print summary
-    print_stats_summary(stats)
+    # Save stats if requested
+    if args.stats_file:
+        stats_path = Path(args.stats_file)
+        stats_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(stats_path, 'w') as f:
+            json.dump(stats, f, indent=2)
+        print(f"\nSaved stats to: {stats_path}")
 
-    # Save
-    save_stats(stats, args.output)
+    # Pass 2: Scale and save
+    if not args.skip_scaling:
+        output_dir = Path(args.output_dir)
+        pass2_scale_and_save(files, stats, NORMALIZE_COLS, output_dir)
 
-    print("\nDone! Use these stats in your config.yaml or load in your dataset.")
+    print("\n" + "=" * 60)
+    print("DONE")
+    print("=" * 60)
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    exit(main())
