@@ -30,13 +30,48 @@ def find_institution_files(data_dir: str) -> List[Path]:
     return files
 
 
+# Columns that should NEVER be scaled (IDs, categorical, binary flags)
+DO_NOT_SCALE = {
+    # IDs / keys
+    "case_id",
+    "mpog_case_id",
+    # Categorical
+    "institution",
+    "sex",
+    # Binary flag columns
+    "phys_bp_sys_non_invasive_flag",
+    "phys_bp_dias_non_invasive_flag",
+    "phys_bp_mean_non_invasive_flag",
+    "phys_spo2_%_flag",
+    "phys_spo2_pulse_rate_flag",
+    "phys_end_tidal_co2_(mmhg)_flag",
+    "phys_sevoflurane_exp_%_flag",
+    "phys_isoflurane_exp_%_flag",
+    "phys_desflurane_exp_%_flag",
+    "phys_nitrous_exp_%_flag",
+    "meds_propofol_flag",
+    "meds_fentanyl_flag",
+    "meds_ketamine_flag",
+    "meds_dexmedetomidine_flag",
+    "meds_remifentanil_flag",
+    "meds_phenylephrine_flag",
+    "meds_norepinephrine_flag",
+    "meds_epinephrine_flag",
+    "meds_vasopressin_flag",
+    "meds_ephedrine_flag",
+    "meds_hydromorphone_flag",
+    "meds_glycopyrrolate_flag",
+    "meds_etomidate_flag",
+    "meds_esmolol_flag",
+    "meds_labetalol_flag",
+}
+
+
 def detect_columns_to_scale(files: List[Path]) -> List[str]:
     """
     Detect which columns to scale by reading the first file.
 
-    Returns all numeric columns EXCEPT:
-    - Binary flags (only 0/1 values)
-    - ID/index columns
+    Returns all numeric columns EXCEPT those in DO_NOT_SCALE.
     """
     print("Detecting columns to scale from first file...")
 
@@ -45,10 +80,15 @@ def detect_columns_to_scale(files: List[Path]) -> List[str]:
     del table
 
     columns_to_scale = []
-    binary_columns = []
+    excluded_columns = []
     skipped_columns = []
 
     for col in df.columns:
+        # Skip columns in the exclusion list
+        if col in DO_NOT_SCALE:
+            excluded_columns.append(col)
+            continue
+
         # Skip non-numeric (handle pandas extension dtypes)
         try:
             if not np.issubdtype(df[col].dtype, np.number):
@@ -59,19 +99,15 @@ def detect_columns_to_scale(files: List[Path]) -> List[str]:
             skipped_columns.append(col)
             continue
 
-        # Check if binary (only 0, 1, or NaN)
-        unique_vals = df[col].dropna().unique()
-        if len(unique_vals) <= 2 and set(unique_vals).issubset({0, 1, 0.0, 1.0}):
-            binary_columns.append(col)
-            continue
-
         columns_to_scale.append(col)
 
     del df
     gc.collect()
 
     print(f"  Numeric columns to scale: {len(columns_to_scale)}")
-    print(f"  Binary flags (not scaling): {len(binary_columns)}")
+    print(f"  Excluded (IDs/categorical/flags): {len(excluded_columns)}")
+    if excluded_columns:
+        print(f"    -> {excluded_columns}")
     print(f"  Non-numeric (skipped): {len(skipped_columns)}")
 
     return columns_to_scale
