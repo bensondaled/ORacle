@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=scale_exp
-#SBATCH --partition=spgpu
+#SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
