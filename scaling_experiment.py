@@ -46,7 +46,7 @@ def parse_args():
     # Core arguments
     parser.add_argument(
         "--num-institutions", type=int, required=True,
-        help="Number of training institutions (5, 10, 20, 40, 60, 70)"
+        help="Number of training institutions (5, 10, 20, 40, 60). 60 = all available (67)"
     )
     parser.add_argument(
         "--data-dir", type=str, required=True,

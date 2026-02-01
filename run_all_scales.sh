@@ -13,8 +13,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SLURM_SCRIPT="${SCRIPT_DIR}/slurm_scaling_experiment.sh"
 
-# Default scales
-DEFAULT_SCALES=(5 10 20 40 60 70)
+# Default scales (60 = all 67 available institutions)
+DEFAULT_SCALES=(5 10 20 40 60)
 
 # Parse arguments
 DEBUG=0

@@ -336,10 +336,13 @@ if __name__ == "__main__":
     print("=" * 60)
     print("Institution Selection Preview")
     print("=" * 60)
+    print(f"Test institutions (held out): {sorted(TEST_INSTITUTIONS)}")
+    print(f"Available for training: {len(AVAILABLE_INSTITUTIONS)}")
 
-    for n in [5, 10, 20, 40, 60, 70]:
+    for n in [5, 10, 20, 40, 60]:
         summary = get_scale_summary(n)
-        print(f"\nScale {n}:")
+        label = f"Scale {n}" if n < 60 else f"Scale {n} (all available)"
+        print(f"\n{label}:")
         print(f"  Selected: {summary['n_selected']} institutions, {summary['total_cases']:,} cases")
         for region, info in summary["regions"].items():
             print(f"    {region}: {info['count']} institutions, {info['cases']:,} cases")
