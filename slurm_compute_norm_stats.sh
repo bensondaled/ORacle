@@ -92,6 +92,12 @@ VENV_PY="$(${POETRY} run python -c 'import sys; print(sys.executable)')"
 echo "Poetry venv python: ${VENV_PY}"
 
 echo ""
+echo "Pulling latest ORacle code..."
+cd "${ORACLE_DIR}"
+git pull
+cd "${POETRY_DIR}"
+
+echo ""
 echo "Checking Python packages..."
 ${POETRY} run python -c "import pandas; import numpy; import tqdm; print('All packages available')"
 
