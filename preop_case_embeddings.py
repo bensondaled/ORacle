@@ -546,6 +546,8 @@ class PreopCaseEmbedder:
         for col in num_cols:
             if col in df.columns:
                 miss_col = f"{col}_missing"
+                # Convert to numeric first (handles any string values)
+                df[col] = pd.to_numeric(df[col], errors="coerce")
                 df[miss_col] = df[col].isna().astype(float)
                 df[col] = df[col].fillna(0).astype(float)
                 missing_cols.append(miss_col)
@@ -555,12 +557,21 @@ class PreopCaseEmbedder:
             if col in df.columns:
                 df[col] = df[col].fillna("Unknown").astype(str)
 
-        # Binary: add _missing indicator, fill with 0
+        # Binary: convert Yes/No strings to 1/0, add _missing indicator
         for col in bin_cols:
             if col in df.columns:
                 miss_col = f"{col}_missing"
                 df[miss_col] = df[col].isna().astype(float)
-                df[col] = df[col].fillna(0).astype(float)
+                # Handle string values like "Yes"/"No"
+                if df[col].dtype == object or str(df[col].dtype) == "string":
+                    df[col] = df[col].map(
+                        lambda x: 1 if str(x).lower() in ("yes", "true", "1", "1.0")
+                        else (0 if str(x).lower() in ("no", "false", "0", "0.0", "nan", "none", "")
+                              else (float(x) if pd.notna(x) else 0))
+                    )
+                else:
+                    df[col] = df[col].fillna(0)
+                df[col] = df[col].astype(float)
                 missing_cols.append(miss_col)
 
         # Build preprocessing pipeline
