@@ -29,8 +29,9 @@ EPOCHS="${EPOCHS:-10}"
 BATCH_SIZE="${BATCH_SIZE:-4096}"
 LR="${LR:-0.0001}"
 
-# WandB
+# WandB (set NO_WANDB=1 to disable)
 WANDB_PROJECT="${WANDB_PROJECT:-oracle-scaling-study}"
+NO_WANDB="${NO_WANDB:-0}"
 
 # -----------------------------
 # Environment
@@ -125,7 +126,7 @@ echo "Poetry venv python: ${VENV_PY}"
 echo ""
 echo "Checking packages..."
 ${POETRY} run python -c "import torch; print(f'PyTorch: {torch.__version__}, CUDA: {torch.cuda.is_available()}')"
-${POETRY} run python -c "import wandb; print(f'WandB: {wandb.__version__}')"
+${POETRY} run python -c "import wandb; print(f'WandB: {wandb.__version__}')" 2>/dev/null || { echo "WandB not installed, disabling"; NO_WANDB=1; }
 
 # -----------------------------
 # Build command
@@ -142,6 +143,10 @@ CMD="${CMD} --wandb-project ${WANDB_PROJECT}"
 
 if [ "${DEBUG}" = "1" ]; then
     CMD="${CMD} --debug"
+fi
+
+if [ "${NO_WANDB}" = "1" ]; then
+    CMD="${CMD} --no-wandb"
 fi
 
 # -----------------------------
