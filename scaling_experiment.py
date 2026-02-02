@@ -163,6 +163,11 @@ def main():
     config["save_path"] = str(output_dir)
     config["cache_path"] = str(output_dir / "cache")
 
+    # IMPORTANT: Data is already scaled - disable normalization to avoid double-scaling
+    if "normalization" not in config:
+        config["normalization"] = {}
+    config["normalization"]["enabled"] = False
+
     # Debug mode settings
     debug_frac = 0.01 if args.debug else None
 
