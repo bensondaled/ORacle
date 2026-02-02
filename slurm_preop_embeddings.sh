@@ -5,8 +5,8 @@
 #SBATCH --mem=64G
 #SBATCH --cpus-per-task=8
 #SBATCH --time=8:00:00
-#SBATCH --output=logs/preop_emb_%j.out
-#SBATCH --error=logs/preop_emb_%j.err
+#SBATCH --output=/home/%u/logs/preop_emb_%j.out
+#SBATCH --error=/home/%u/logs/preop_emb_%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
 
 # =============================================================================
@@ -28,49 +28,99 @@
 #
 # =============================================================================
 
-set -e  # Exit on error
+set -euo pipefail
 
-# Print job info
-echo "=============================================="
-echo "SLURM Job: Preoperative Case Embeddings"
-echo "=============================================="
-echo "Job ID: ${SLURM_JOB_ID}"
-echo "Node: ${SLURMD_NODENAME}"
-echo "Start time: $(date)"
-echo "Working directory: $(pwd)"
-echo "=============================================="
-
-# Create logs directory if it doesn't exist
-mkdir -p logs
-
-# Default paths (can be overridden via --export)
+# -----------------------------
+# Config
+# -----------------------------
 CASEINFO_DB="${CASEINFO_DB:-/nfs/turbo/umms-sachinkh/PCRC 247 Aghaeepour/case_info/pcrc_caseinfo.duckdb}"
 MEDS_DB="${MEDS_DB:-/nfs/turbo/umms-sachinkh/PCRC 247 Aghaeepour/pcrc_0247_preop_meds.duckdb}"
-OUTPUT_DIR="${OUTPUT_DIR:-embeddings}"
+ORACLE_DIR="${ORACLE_DIR:-$HOME/ORacle}"
+POETRY_DIR="${POETRY_DIR:-$HOME/pcrc_0247_duckdb}"
+OUTPUT_DIR="${OUTPUT_DIR:-${ORACLE_DIR}/embeddings}"
 OUTPUT_FILE="${OUTPUT_DIR}/preop_embeddings.parquet"
-
-# Create output directory
-mkdir -p "${OUTPUT_DIR}"
 
 # Debug mode check
 DEBUG_FLAG=""
-if [ "${DEBUG}" = "1" ]; then
-    echo "Running in DEBUG mode (1% sample)"
+if [ "${DEBUG:-0}" = "1" ]; then
     DEBUG_FLAG="--debug"
     OUTPUT_FILE="${OUTPUT_DIR}/preop_embeddings_debug.parquet"
 fi
 
-# Environment setup
+# -----------------------------
+# Environment
+# -----------------------------
+export PYTHONUNBUFFERED=1
+export PATH="$HOME/.local/bin:$PATH"
+
+mkdir -p "$HOME/logs"
+mkdir -p "${OUTPUT_DIR}"
+
+# -----------------------------
+# Modules
+# -----------------------------
+if [ -f /etc/profile.d/modules.sh ]; then
+  source /etc/profile.d/modules.sh
+elif [ -f /usr/share/Modules/init/bash ]; then
+  source /usr/share/Modules/init/bash
+fi
+
+module purge || true
+module load python || true
+
+# -----------------------------
+# Poetry setup
+# -----------------------------
+PYTHON_BIN="$(command -v python || command -v python3 || true)"
+if [ -z "${PYTHON_BIN}" ]; then
+  echo "ERROR: python not found"
+  exit 2
+fi
+
+POETRY=""
+if "${PYTHON_BIN}" -m poetry --version >/dev/null 2>&1; then
+  POETRY="${PYTHON_BIN} -m poetry"
+elif command -v poetry >/dev/null 2>&1; then
+  POETRY="poetry"
+else
+  echo "ERROR: poetry not available"
+  exit 2
+fi
+
+# Print job info
+echo "=============================================="
+echo "PREOPERATIVE CASE EMBEDDING GENERATION"
+echo "=============================================="
+echo "Job ID:        ${SLURM_JOB_ID:-local}"
+echo "Node:          ${SLURMD_NODENAME:-local}"
+echo "Python:        ${PYTHON_BIN}"
+echo "Poetry:        ${POETRY}"
+echo "Poetry dir:    ${POETRY_DIR}"
+echo "Oracle dir:    ${ORACLE_DIR}"
+echo "Case info DB:  ${CASEINFO_DB}"
+echo "Meds DB:       ${MEDS_DB}"
+echo "Output:        ${OUTPUT_FILE}"
+echo "Debug mode:    ${DEBUG:-0}"
+echo "Start:         $(date)"
+echo "=============================================="
+
+# Sanity checks
+[ -d "${POETRY_DIR}" ] || { echo "ERROR: POETRY_DIR missing: ${POETRY_DIR}"; exit 1; }
+[ -f "${ORACLE_DIR}/generate_preop_embeddings.py" ] || { echo "ERROR: Script not found"; exit 1; }
+[ -f "${CASEINFO_DB}" ] || { echo "ERROR: Case info database not found: ${CASEINFO_DB}"; exit 1; }
+[ -f "${MEDS_DB}" ] || { echo "ERROR: Medications database not found: ${MEDS_DB}"; exit 1; }
+
+# Go to poetry directory to use its environment
+cd "${POETRY_DIR}"
+
 echo ""
-echo "Setting up environment..."
+echo "Poetry version: $(${POETRY} --version)"
+echo "Syncing poetry environment..."
+${POETRY} install --no-root 2>/dev/null || ${POETRY} sync --no-root 2>/dev/null || true
 
-# Load modules (adjust for your cluster)
-# module load python/3.10
-# module load cuda/11.8
-
-# Activate conda environment (adjust for your setup)
-# source ~/.bashrc
-# conda activate oracle
+# Show the venv python
+VENV_PY="$(${POETRY} run python -c 'import sys; print(sys.executable)')"
+echo "Poetry venv python: ${VENV_PY}"
 
 # Check GPU
 echo ""
@@ -79,34 +129,25 @@ nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv 2>/dev/null ||
 
 # Check Python and dependencies
 echo ""
-echo "Python: $(poetry run python --version)"
-poetry run python -c "import torch; print(f'PyTorch: {torch.__version__}, CUDA: {torch.cuda.is_available()}')"
-poetry run python -c "import sentence_transformers; print(f'SentenceTransformers: {sentence_transformers.__version__}')"
+echo "Checking dependencies..."
+${POETRY} run python -c "import torch; print(f'PyTorch: {torch.__version__}, CUDA: {torch.cuda.is_available()}')"
+${POETRY} run python -c "import sentence_transformers; print(f'SentenceTransformers: {sentence_transformers.__version__}')"
+${POETRY} run python -c "import duckdb; print(f'DuckDB: {duckdb.__version__}')"
 
-# Print configuration
+# Pull latest code
 echo ""
-echo "Configuration:"
-echo "  Case info DB: ${CASEINFO_DB}"
-echo "  Medications DB: ${MEDS_DB}"
-echo "  Output: ${OUTPUT_FILE}"
-echo ""
-
-# Check database files exist
-if [ ! -f "${CASEINFO_DB}" ]; then
-    echo "ERROR: Case info database not found: ${CASEINFO_DB}"
-    exit 1
-fi
-if [ ! -f "${MEDS_DB}" ]; then
-    echo "ERROR: Medications database not found: ${MEDS_DB}"
-    exit 1
-fi
+echo "Pulling latest ORacle code..."
+cd "${ORACLE_DIR}"
+git pull
+cd "${POETRY_DIR}"
 
 # Run embedding generation
+echo ""
 echo "=============================================="
 echo "Starting embedding generation..."
 echo "=============================================="
 
-poetry run python generate_preop_embeddings.py \
+${POETRY} run python -u "${ORACLE_DIR}/generate_preop_embeddings.py" \
     --caseinfo-db "${CASEINFO_DB}" \
     --meds-db "${MEDS_DB}" \
     --output "${OUTPUT_FILE}" \
@@ -126,7 +167,7 @@ if [ -f "${OUTPUT_FILE}" ]; then
     ls -lh "${OUTPUT_FILE}"
 
     # Quick stats
-    poetry run python -c "
+    ${POETRY} run python -c "
 import pandas as pd
 import numpy as np
 df = pd.read_parquet('${OUTPUT_FILE}')
