@@ -267,32 +267,46 @@ def main():
         raise ValueError("No training files found!")
 
     # Split files into train/val (by file, not by case)
+    # Use only 1-2 files for validation to keep memory low
     np.random.seed(args.seed)
     np.random.shuffle(train_file_paths)
-    n_val_files = max(1, int(len(train_file_paths) * args.val_frac))
+    n_val_files = min(2, max(1, int(len(train_file_paths) * args.val_frac)))  # Max 2 val files
     val_file_paths = train_file_paths[:n_val_files]
     train_file_paths = train_file_paths[n_val_files:]
 
     print(f"Training files: {len(train_file_paths)}")
     print(f"Validation files: {len(val_file_paths)}")
 
-    # Load validation data into memory (smaller - just a few institutions)
-    val_df = load_institutions_data(
-        data_dir=args.data_dir,
-        institution_ids=[],  # Will load from file paths below
-        debug_frac=debug_frac,
-        seed=args.seed,
-    ) if False else pd.concat([pd.read_feather(f) for f in val_file_paths], ignore_index=True)
+    # Load validation data (1-2 files, sampled to keep memory low)
+    val_dfs = []
+    for vf in val_file_paths:
+        vdf = pd.read_feather(vf)
+        # Sample 20% of cases per file to further reduce memory
+        case_ids = vdf['mpog_case_id'].unique()
+        np.random.seed(args.seed)
+        n_sample = max(100, int(len(case_ids) * 0.2))  # 20% or at least 100 cases
+        sampled_ids = np.random.choice(case_ids, size=min(n_sample, len(case_ids)), replace=False)
+        vdf = vdf[vdf['mpog_case_id'].isin(sampled_ids)]
+        val_dfs.append(vdf)
+        print(f"  Val file: {Path(vf).name}, sampled {len(sampled_ids)} cases, {len(vdf):,} rows")
+        del case_ids, sampled_ids
+    val_df = pd.concat(val_dfs, ignore_index=True)
+    del val_dfs
+    gc.collect()
 
-    # Load test data (4 held-out institutions - always fits in memory)
+    # Load test data (4 held-out institutions)
+    # Sample to keep memory low
     test_df = load_test_data(
         data_dir=args.data_dir,
-        debug_frac=debug_frac,
+        debug_frac=0.2 if debug_frac is None else debug_frac,  # Always sample test to 20%
         seed=args.seed,
     )
+    print(f"Test data: {test_df['mpog_case_id'].nunique()} cases, {len(test_df):,} rows")
+    gc.collect()
 
     # Build vocab from validation data (representative sample)
     vocabs = build_vocab(val_df, config.get("static_categoricals", []))
+    print(f"Vocab built. Val data: {val_df['mpog_case_id'].nunique()} cases, {len(val_df):,} rows")
 
     # Save data info
     data_info = {
