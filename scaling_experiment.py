@@ -329,7 +329,7 @@ def main():
         train_dataset,
         batch_size=config["batch_size_bp"],
         shuffle=True,
-        num_workers=config.get("num_workers", 4),
+        num_workers=min(config.get("num_workers", 8), 8),
         pin_memory=True,
         collate_fn=IntraOpDataset.collate_fn,
         drop_last=True,
@@ -339,7 +339,7 @@ def main():
         val_dataset,
         batch_size=config["batch_size_bp"],
         shuffle=False,
-        num_workers=config.get("num_workers", 4),
+        num_workers=min(config.get("num_workers", 8), 8),
         pin_memory=True,
         collate_fn=IntraOpDataset.collate_fn,
     )
@@ -348,7 +348,7 @@ def main():
         test_dataset,
         batch_size=config["batch_size_bp"],
         shuffle=False,
-        num_workers=config.get("num_workers", 4),
+        num_workers=min(config.get("num_workers", 8), 8),
         pin_memory=True,
         collate_fn=IntraOpDataset.collate_fn,
     )
@@ -362,7 +362,7 @@ def main():
     print("BUILDING MODEL")
     print("=" * 60)
 
-    model = IntraOpPredictor(config, vocabs).to(device)
+    model = IntraOpPredictor(config).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters: {n_params:,}")
 
