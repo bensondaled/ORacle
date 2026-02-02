@@ -62,6 +62,7 @@ def train_autoreg_epoch(
     task_mode = config.get("task_mode", "autoreg")
     use_amp = config.get("use_mixed_precision", False) and torch.cuda.is_available()
     grad_clip_max_norm = config.get("grad_clip_max_norm", 0.0)
+    grad_accum_steps = config.get("gradient_accumulation_steps", 1)
 
     try:
         total_steps = len(dataloader)
@@ -77,11 +78,15 @@ def train_autoreg_epoch(
     max_consecutive_nans = 50  # Stop training if too many consecutive NaN losses
 
     logger.info(f"Epoch {epoch} start. Task mode: {task_mode}")
+    if grad_accum_steps > 1:
+        logger.info(f"  Gradient accumulation: {grad_accum_steps} steps (effective batch = {config.get('batch_size_bp', 'N/A')} x {grad_accum_steps})")
 
     for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Epoch {epoch+1}", total=total_steps)):
         global_step += 1 # Increment global_step at the very beginning of the loop
 
-        optimizer.zero_grad(set_to_none=True)
+        # Only zero gradients at start of accumulation cycle
+        if batch_idx % grad_accum_steps == 0:
+            optimizer.zero_grad(set_to_none=True)
         # OPTIMIZED: Faster device transfer with proper dtype conversion
         float_keys = ["vitals", "meds", "gases", "bolus", "static_num"]
         for k, v in batch.items():
@@ -288,11 +293,13 @@ def train_autoreg_epoch(
             # Reset consecutive NaN counter on successful loss computation
             consecutive_nan_losses = 0
 
-        # Backprop (gradients already zeroed at loop start)
+        # Backprop (gradients already zeroed at start of accumulation cycle)
+        # Scale loss by accumulation steps for correct gradient magnitude
+        scaled_loss = loss / grad_accum_steps
         if use_amp and scaler:
-            scaler.scale(loss).backward()
+            scaler.scale(scaled_loss).backward()
         else:
-            loss.backward()
+            scaled_loss.backward()
 
         # Enhanced gradient monitoring with hypotension-specific tracking
         if config.get("log_gradient_norm", False) and batch_idx % (log_every * 5) == 0:
@@ -339,50 +346,54 @@ def train_autoreg_epoch(
                     
                 safe_log_metrics(grad_metrics, step=global_step)
 
-        # Enhanced gradient clipping
-        # Note: When using mixed precision (scaler), NaN/Inf detection is handled automatically by scaler.step()
-        # Manual checking would interfere with the scaler's state management
-        if grad_clip_max_norm > 0:
-            # Only manually check for NaN if NOT using mixed precision
-            if not (use_amp and scaler):
-                nan_grads = False
-                for name, param in model.named_parameters():
-                    if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
-                        logger.warning(f"NaN/Inf gradients detected in {name}")
-                        nan_grads = True
-                        break
+        # Only do optimizer step after accumulation is complete
+        is_accumulation_step = (batch_idx + 1) % grad_accum_steps == 0 or (batch_idx + 1) == total_steps
 
-                if nan_grads:
-                    logger.warning(f"Skipping optimizer step due to NaN gradients at step {global_step}")
-                    optimizer.zero_grad(set_to_none=True)
-                    del loss, preds, fused_logits, bp_logits, batch_metrics, batch
-                    torch.cuda.empty_cache()
-                    continue
+        if is_accumulation_step:
+            # Enhanced gradient clipping
+            # Note: When using mixed precision (scaler), NaN/Inf detection is handled automatically by scaler.step()
+            # Manual checking would interfere with the scaler's state management
+            if grad_clip_max_norm > 0:
+                # Only manually check for NaN if NOT using mixed precision
+                if not (use_amp and scaler):
+                    nan_grads = False
+                    for name, param in model.named_parameters():
+                        if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
+                            logger.warning(f"NaN/Inf gradients detected in {name}")
+                            nan_grads = True
+                            break
 
-            # Perform gradient clipping
+                    if nan_grads:
+                        logger.warning(f"Skipping optimizer step due to NaN gradients at step {global_step}")
+                        optimizer.zero_grad(set_to_none=True)
+                        del loss, preds, fused_logits, bp_logits, batch_metrics, batch
+                        torch.cuda.empty_cache()
+                        continue
+
+                # Perform gradient clipping
+                if use_amp and scaler:
+                    # Unscale before clipping when using mixed precision
+                    scaler.unscale_(optimizer)
+
+                total_norm = nn.utils.clip_grad_norm_(
+                    list(model.parameters()) +
+                    (list(loss_weight_module.parameters()) if loss_weight_module else []),
+                    grad_clip_max_norm
+                )
+
+                # Log extreme gradient norms
+                if total_norm > grad_clip_max_norm * 2:
+                    logger.warning(f"Large gradient norm {total_norm:.2f} clipped to {grad_clip_max_norm}")
+
+            # Optimizer step
             if use_amp and scaler:
-                # Unscale before clipping when using mixed precision
-                scaler.unscale_(optimizer)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
 
-            total_norm = nn.utils.clip_grad_norm_(
-                list(model.parameters()) +
-                (list(loss_weight_module.parameters()) if loss_weight_module else []),
-                grad_clip_max_norm
-            )
-
-            # Log extreme gradient norms
-            if total_norm > grad_clip_max_norm * 2:
-                logger.warning(f"Large gradient norm {total_norm:.2f} clipped to {grad_clip_max_norm}")
-
-        # Optimizer step
-        if use_amp and scaler:
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            optimizer.step()
-
-        if scheduler and config.get("use_lr_scheduler", True):
-            scheduler.step()
+            if scheduler and config.get("use_lr_scheduler", True):
+                scheduler.step()
 
         # CRITICAL: Detach loss value to avoid keeping computation graph
         loss_item = loss.detach().item()

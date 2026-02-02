@@ -26,7 +26,8 @@ POETRY_DIR="${POETRY_DIR:-$HOME/pcrc_0247_duckdb}"
 
 # Training settings
 EPOCHS="${EPOCHS:-10}"
-BATCH_SIZE="${BATCH_SIZE:-4096}"
+BATCH_SIZE="${BATCH_SIZE:-512}"
+GRAD_ACCUM="${GRAD_ACCUM:-4}"  # Effective batch = 512 * 4 = 2048
 LR="${LR:-0.0001}"
 
 # WandB (set NO_WANDB=1 to disable)
@@ -91,6 +92,8 @@ echo "Oracle Dir:       ${ORACLE_DIR}"
 echo "Poetry Dir:       ${POETRY_DIR}"
 echo "Epochs:           ${EPOCHS}"
 echo "Batch Size:       ${BATCH_SIZE}"
+echo "Grad Accum:       ${GRAD_ACCUM}"
+echo "Effective Batch:  $((BATCH_SIZE * GRAD_ACCUM))"
 echo "Learning Rate:    ${LR}"
 echo "Start:            $(date)"
 echo "=============================================="
@@ -138,6 +141,7 @@ CMD="${CMD} --output-dir \"${OUTPUT_DIR}\""
 CMD="${CMD} --seed ${SEED}"
 CMD="${CMD} --epochs ${EPOCHS}"
 CMD="${CMD} --batch-size ${BATCH_SIZE}"
+CMD="${CMD} --grad-accum ${GRAD_ACCUM}"
 CMD="${CMD} --lr ${LR}"
 CMD="${CMD} --wandb-project ${WANDB_PROJECT}"
 

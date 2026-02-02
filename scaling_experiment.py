@@ -25,6 +25,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from torch.amp import GradScaler
 
 # Add transformer_model to path
 sys.path.insert(0, str(Path(__file__).parent / "transformer_model" / "autoreg"))
@@ -64,7 +65,8 @@ def parse_args():
     # Experiment settings
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--epochs", type=int, default=10, help="Training epochs")
-    parser.add_argument("--batch-size", type=int, default=1024, help="Batch size")
+    parser.add_argument("--batch-size", type=int, default=512, help="Batch size (reduced for V100 16GB)")
+    parser.add_argument("--grad-accum", type=int, default=1, help="Gradient accumulation steps")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--val-frac", type=float, default=0.1, help="Validation fraction")
 
@@ -223,6 +225,10 @@ def main():
 
     # Disable torch.compile - cluster missing Python dev headers
     config["use_compile"] = False
+
+    # Memory optimizations for V100 (16GB)
+    config["use_mixed_precision"] = True  # FP16 training
+    config["gradient_accumulation_steps"] = args.grad_accum  # Simulate larger batches
 
     # Debug mode settings
     debug_frac = 0.01 if args.debug else None
@@ -389,6 +395,11 @@ def main():
             eta_min=config.get("scheduler_eta_min", 1e-6),
         )
 
+    # Mixed precision scaler
+    use_amp = config.get("use_mixed_precision", False) and torch.cuda.is_available()
+    scaler = GradScaler(enabled=use_amp)
+    print(f"Mixed precision (AMP): {use_amp}")
+
     # Training loop
     print("\n" + "=" * 60)
     print("TRAINING")
@@ -413,6 +424,7 @@ def main():
             epoch=epoch,
             global_step=global_step,
             save_path=output_dir,
+            scaler=scaler,
         )
 
         # Validate
