@@ -221,6 +221,9 @@ def main():
         config["normalization"] = {}
     config["normalization"]["enabled"] = False
 
+    # Disable torch.compile - cluster missing Python dev headers
+    config["use_compile"] = False
+
     # Debug mode settings
     debug_frac = 0.01 if args.debug else None
 
