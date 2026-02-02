@@ -79,9 +79,9 @@ nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv 2>/dev/null ||
 
 # Check Python and dependencies
 echo ""
-echo "Python: $(python --version)"
-python -c "import torch; print(f'PyTorch: {torch.__version__}, CUDA: {torch.cuda.is_available()}')"
-python -c "import sentence_transformers; print(f'SentenceTransformers: {sentence_transformers.__version__}')"
+echo "Python: $(poetry run python --version)"
+poetry run python -c "import torch; print(f'PyTorch: {torch.__version__}, CUDA: {torch.cuda.is_available()}')"
+poetry run python -c "import sentence_transformers; print(f'SentenceTransformers: {sentence_transformers.__version__}')"
 
 # Print configuration
 echo ""
@@ -106,7 +106,7 @@ echo "=============================================="
 echo "Starting embedding generation..."
 echo "=============================================="
 
-python generate_preop_embeddings.py \
+poetry run python generate_preop_embeddings.py \
     --caseinfo-db "${CASEINFO_DB}" \
     --meds-db "${MEDS_DB}" \
     --output "${OUTPUT_FILE}" \
@@ -126,7 +126,7 @@ if [ -f "${OUTPUT_FILE}" ]; then
     ls -lh "${OUTPUT_FILE}"
 
     # Quick stats
-    python -c "
+    poetry run python -c "
 import pandas as pd
 import numpy as np
 df = pd.read_parquet('${OUTPUT_FILE}')
