@@ -64,7 +64,7 @@ def parse_args():
     # Experiment settings
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--epochs", type=int, default=10, help="Training epochs")
-    parser.add_argument("--batch-size", type=int, default=4096, help="Batch size")
+    parser.add_argument("--batch-size", type=int, default=512, help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--val-frac", type=float, default=0.1, help="Validation fraction")
 
