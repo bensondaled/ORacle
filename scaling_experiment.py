@@ -402,12 +402,14 @@ def main():
         # Train
         train_metrics, global_step = train_autoreg_epoch(
             model=model,
-            loader=train_loader,
+            dataloader=train_loader,
             optimizer=optimizer,
+            scheduler=scheduler,
             config=config,
+            device=device,
             epoch=epoch,
             global_step=global_step,
-            device=device,
+            save_path=output_dir,
         )
 
         # Validate
@@ -446,9 +448,7 @@ def main():
             }, output_dir / "best_model.pt")
             print(f"  -> New best model saved (val_loss={best_val_loss:.4f})")
 
-        # Step scheduler
-        if scheduler:
-            scheduler.step()
+        # Note: scheduler.step() is called inside train_autoreg_epoch per batch
 
     print(f"\nBest epoch: {best_epoch} (val_loss={best_val_loss:.4f})")
 
