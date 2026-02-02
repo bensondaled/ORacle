@@ -190,6 +190,34 @@ def get_institution_file(data_dir: Path, inst_id: int) -> Optional[Path]:
     return None
 
 
+def get_institution_file_paths(
+    data_dir: str,
+    institution_ids: List[int],
+) -> List[str]:
+    """
+    Get file paths for specified institutions (for streaming dataset).
+
+    Args:
+        data_dir: Directory containing institution feather files
+        institution_ids: List of institution IDs
+
+    Returns:
+        List of file paths that exist
+    """
+    data_path = Path(data_dir)
+    file_paths = []
+
+    for inst_id in institution_ids:
+        file_path = get_institution_file(data_path, inst_id)
+        if file_path is not None:
+            file_paths.append(str(file_path))
+        else:
+            print(f"  Warning: No file found for institution {inst_id}")
+
+    print(f"Found {len(file_paths)}/{len(institution_ids)} institution files")
+    return file_paths
+
+
 def load_institutions_data(
     data_dir: str,
     institution_ids: List[int],

@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).parent / "transformer_model" / "autoreg"))
 
 from scaling_data_loader import (
     select_institutions,
+    get_institution_file_paths,
     load_institutions_data,
     load_test_data,
     create_train_val_split,
@@ -252,54 +253,67 @@ def main():
     # Initialize WandB
     wandb_run = setup_wandb(args, config, selected)
 
-    # Load training data
+    # Get training file paths (streaming - doesn't load into memory)
     print("\n" + "=" * 60)
-    print("LOADING DATA")
+    print("LOADING DATA (STREAMING MODE)")
     print("=" * 60)
 
-    train_val_df = load_institutions_data(
+    train_file_paths = get_institution_file_paths(
         data_dir=args.data_dir,
         institution_ids=selected,
+    )
+
+    if not train_file_paths:
+        raise ValueError("No training files found!")
+
+    # Split files into train/val (by file, not by case)
+    np.random.seed(args.seed)
+    np.random.shuffle(train_file_paths)
+    n_val_files = max(1, int(len(train_file_paths) * args.val_frac))
+    val_file_paths = train_file_paths[:n_val_files]
+    train_file_paths = train_file_paths[n_val_files:]
+
+    print(f"Training files: {len(train_file_paths)}")
+    print(f"Validation files: {len(val_file_paths)}")
+
+    # Load validation data into memory (smaller - just a few institutions)
+    val_df = load_institutions_data(
+        data_dir=args.data_dir,
+        institution_ids=[],  # Will load from file paths below
         debug_frac=debug_frac,
         seed=args.seed,
-    )
+    ) if False else pd.concat([pd.read_feather(f) for f in val_file_paths], ignore_index=True)
 
-    # Split train/val
-    train_df, val_df = create_train_val_split(
-        train_val_df, val_frac=args.val_frac, seed=args.seed
-    )
-    del train_val_df
-    gc.collect()
-
-    # Load test data
+    # Load test data (4 held-out institutions - always fits in memory)
     test_df = load_test_data(
         data_dir=args.data_dir,
         debug_frac=debug_frac,
         seed=args.seed,
     )
 
+    # Build vocab from validation data (representative sample)
+    vocabs = build_vocab(val_df, config.get("static_categoricals", []))
+
     # Save data info
     data_info = {
         "num_institutions": args.num_institutions,
         "selected_institutions": selected,
         "test_institutions": list(TEST_INSTITUTIONS),
-        "train_cases": int(train_df['mpog_case_id'].nunique()),
-        "train_rows": len(train_df),
+        "train_files": len(train_file_paths),
+        "val_files": len(val_file_paths),
         "val_cases": int(val_df['mpog_case_id'].nunique()),
         "val_rows": len(val_df),
         "test_cases": int(test_df['mpog_case_id'].nunique()),
         "test_rows": len(test_df),
         "debug_mode": args.debug,
+        "streaming_mode": True,
     }
 
     with open(output_dir / "data_info.json", "w") as f:
         json.dump(data_info, f, indent=2)
 
-    # Build vocab
-    vocabs = build_vocab(train_df, config.get("static_categoricals", []))
-
     # Import dataset and model classes
-    from intraop_dataset import IntraOpDataset
+    from intraop_dataset import IntraOpDataset, StreamingIntraOpDataset
     from model import IntraOpPredictor
     from train_autoreg import train_autoreg_epoch
 
@@ -308,13 +322,20 @@ def main():
     print("CREATING DATASETS")
     print("=" * 60)
 
-    train_dataset = IntraOpDataset(
-        df=train_df,
+    # Training: streaming dataset (memory efficient)
+    train_dataset = StreamingIntraOpDataset(
+        file_paths=train_file_paths,
         config=config,
         vocabs=vocabs,
         split="train",
+        shuffle_files=True,
+        shuffle_samples=True,
+        debug_frac=debug_frac,
+        seed=args.seed,
     )
+    print(f"Train: StreamingIntraOpDataset with {len(train_file_paths)} files")
 
+    # Validation: regular dataset (fits in memory)
     val_dataset = IntraOpDataset(
         df=val_df,
         config=config,
@@ -322,6 +343,7 @@ def main():
         split="val",
     )
 
+    # Test: regular dataset (fits in memory)
     test_dataset = IntraOpDataset(
         df=test_df,
         config=config,
@@ -330,17 +352,18 @@ def main():
     )
 
     # Free DataFrames
-    del train_df, val_df, test_df
+    del val_df, test_df
     gc.collect()
 
     # Create dataloaders
+    # Training: IterableDataset - shuffle=False (handled internally), num_workers=0 for streaming
     train_loader = DataLoader(
         train_dataset,
         batch_size=config["batch_size_bp"],
-        shuffle=True,
-        num_workers=min(config.get("num_workers", 8), 8),
+        shuffle=False,  # Streaming dataset handles shuffling internally
+        num_workers=0,  # IterableDataset works best with single worker
         pin_memory=True,
-        collate_fn=IntraOpDataset.collate_fn,
+        collate_fn=StreamingIntraOpDataset.collate_fn,
         drop_last=True,
     )
 

@@ -515,3 +515,241 @@ class IntraOpDataset(Dataset):
                 result[key] = torch.stack([item[key] for item in batch])
 
         return result
+
+
+class StreamingIntraOpDataset(torch.utils.data.IterableDataset):
+    """
+    Memory-efficient streaming dataset that loads one institution file at a time.
+
+    Instead of loading all data into RAM, this loads institution files sequentially,
+    generates samples from each, then moves to the next file.
+
+    Usage:
+        dataset = StreamingIntraOpDataset(
+            file_paths=['/path/to/inst_1001.feather', '/path/to/inst_1002.feather', ...],
+            config=config,
+            vocabs=vocabs,
+        )
+        loader = DataLoader(dataset, batch_size=512, num_workers=0)  # num_workers=0 required
+    """
+
+    def __init__(
+        self,
+        file_paths: List[str],
+        config: Dict[str, Any],
+        vocabs: Dict[str, Any],
+        split: str = "train",
+        shuffle_files: bool = True,
+        shuffle_samples: bool = True,
+        debug_frac: Optional[float] = None,
+        seed: int = 42,
+    ):
+        self.file_paths = list(file_paths)
+        self.config = config
+        self.vocabs = vocabs
+        self.split = split
+        self.shuffle_files = shuffle_files
+        self.shuffle_samples = shuffle_samples
+        self.debug_frac = debug_frac
+        self.seed = seed
+
+        # Extract config values
+        self.vital_cols = config['vital_cols']
+        self.med_cols = config['med_cols']
+        self.gas_cols = config.get('gas_cols', [])
+        self.bolus_cols = config.get('bolus_cols', [])
+        self.max_len = config['max_len']
+        self.future_steps = config['future_steps']
+        self.static_cat_cols = config.get('static_categoricals', [])
+        self.static_num_cols = config.get('static_numericals', [])
+        self.target_cols = config.get('target_cols', ['phys_bp_mean_non_invasive'])
+        self.vital_flag_cols = config.get('vital_flag_cols', [])
+        self.target_flag_cols = config.get('target_flag_cols', [])
+        self.use_imputation_masking = config.get('use_imputation_masking', False)
+
+        self.normalizer = Normalizer(config)
+        self.vocab_maps = vocabs or {}
+
+        logger.info(f"StreamingIntraOpDataset: {len(file_paths)} files, split={split}")
+
+    def __iter__(self):
+        """Iterate through all files, yielding samples from each."""
+        worker_info = torch.utils.data.get_worker_info()
+
+        # Get file list for this worker (if using multiple workers)
+        if worker_info is None:
+            file_list = self.file_paths
+            worker_seed = self.seed
+        else:
+            # Split files among workers
+            per_worker = len(self.file_paths) // worker_info.num_workers
+            worker_id = worker_info.id
+            start = worker_id * per_worker
+            end = start + per_worker if worker_id < worker_info.num_workers - 1 else len(self.file_paths)
+            file_list = self.file_paths[start:end]
+            worker_seed = self.seed + worker_id
+
+        # Shuffle file order
+        if self.shuffle_files:
+            rng = random.Random(worker_seed)
+            file_list = file_list.copy()
+            rng.shuffle(file_list)
+
+        # Process each file
+        for file_path in file_list:
+            try:
+                yield from self._process_file(file_path, worker_seed)
+            except Exception as e:
+                logger.warning(f"Error processing {file_path}: {e}")
+                continue
+
+    def _process_file(self, file_path: str, seed: int):
+        """Load a file and yield all samples from it."""
+        # Load file
+        df = pd.read_feather(file_path)
+
+        # Debug mode: sample cases
+        if self.debug_frac is not None and self.debug_frac < 1.0:
+            case_ids = df['mpog_case_id'].unique()
+            rng = np.random.RandomState(seed)
+            n_sample = max(1, int(len(case_ids) * self.debug_frac))
+            sampled_ids = rng.choice(case_ids, size=n_sample, replace=False)
+            df = df[df['mpog_case_id'].isin(sampled_ids)]
+
+        if len(df) == 0:
+            return
+
+        # Process static categorical columns
+        for col in self.static_cat_cols:
+            if col in df.columns and col in self.vocab_maps:
+                df[col] = df[col].map(self.vocab_maps[col]).fillna(0).astype(int)
+
+        # Filter valid cases
+        grouped = df.groupby('mpog_case_id')
+        min_len = self.future_steps + 1
+        valid_case_ids = [cid for cid in grouped.groups.keys()
+                         if len(grouped.get_group(cid)) >= min_len]
+
+        if not valid_case_ids:
+            return
+
+        df = df[df['mpog_case_id'].isin(valid_case_ids)]
+        grouped = df.groupby('mpog_case_id')
+
+        # Generate samples
+        samples = []
+        stride = self.config.get('stride', 1)
+        required_past_steps = self.config.get('min_history_steps', 5)
+
+        for cid in grouped.groups.keys():
+            group = grouped.get_group(cid)
+            num_rows = len(group)
+            max_end = num_rows - self.future_steps + 1
+
+            if max_end <= required_past_steps:
+                continue
+
+            for end in range(required_past_steps, max_end, stride):
+                samples.append((cid, end, group))
+
+        # Shuffle samples within file
+        if self.shuffle_samples:
+            rng = random.Random(seed)
+            rng.shuffle(samples)
+
+        # Yield each sample
+        for cid, end, group in samples:
+            try:
+                yield self._get_sample(cid, end, group)
+            except Exception as e:
+                continue  # Skip bad samples silently
+
+    def _get_sample(self, cid: str, end: int, group: pd.DataFrame) -> Dict[str, Any]:
+        """Generate a single sample - mirrors IntraOpDataset.__getitem__."""
+        start = max(0, end - self.max_len)
+        window = group.iloc[start:end]
+        future = group.iloc[end:end + self.future_steps]
+        seq_len = len(window)
+
+        # Initialize arrays
+        vitals = np.zeros((self.max_len, len(self.vital_cols)), dtype=np.float16)
+        meds = np.zeros((self.max_len, len(self.med_cols)), dtype=np.float16)
+        gases = np.zeros((self.max_len, len(self.gas_cols)), dtype=np.float16) if self.gas_cols else np.zeros((self.max_len, 0), dtype=np.float16)
+        bolus = np.zeros((self.max_len, len(self.bolus_cols)), dtype=np.float16) if self.bolus_cols else np.zeros((self.max_len, 0), dtype=np.float16)
+        attention_mask = np.zeros(self.max_len, dtype=np.bool_)
+
+        # Fill arrays (right-aligned)
+        if seq_len > 0:
+            vital_values = window[self.vital_cols].values
+            if self.normalizer.enabled:
+                for i, col in enumerate(self.vital_cols):
+                    vital_values[:, i] = self.normalizer.normalize(vital_values[:, i], col)
+            vitals[-seq_len:] = vital_values.astype(np.float16)
+            meds[-seq_len:] = window[self.med_cols].values.astype(np.float16)
+
+            if self.gas_cols:
+                gases[-seq_len:] = window[self.gas_cols].values.astype(np.float16)
+            if self.bolus_cols:
+                bolus[-seq_len:] = window[self.bolus_cols].values.astype(np.float16)
+
+            attention_mask[-seq_len:] = True
+
+        # Target
+        target = np.zeros((self.future_steps, len(self.target_cols)), dtype=np.float32)
+        if len(future) > 0:
+            target_values = future[self.target_cols].values[:self.future_steps]
+            if self.normalizer.enabled:
+                for i, col in enumerate(self.target_cols):
+                    target_values[:, i] = self.normalizer.normalize(target_values[:, i], col)
+            target[:len(target_values)] = target_values
+
+        # Last input bolus
+        bolus_values = np.zeros(len(self.bolus_cols), dtype=np.float16)
+        if self.bolus_cols and seq_len > 0:
+            bolus_values = window[self.bolus_cols].iloc[-1].values.astype(np.float16)
+
+        # Current row values
+        current_row = window.iloc[-1] if seq_len > 0 else group.iloc[0]
+
+        # Last 5 BP values
+        last5_bp = [60.0] * 5
+        if seq_len > 0:
+            bp_col = self.target_cols[0]
+            bp_vals = window[bp_col].values[-5:]
+            for i, v in enumerate(bp_vals):
+                last5_bp[-(len(bp_vals) - i)] = float(v) if not np.isnan(v) else 60.0
+
+        # Hypo labels
+        hypo_onset_label = float(current_row.get("hypo_onset_label", 0))
+        hypo_onset_type = str(current_row.get("hypo_onset_type", "none"))
+
+        # Static features
+        static_cat = {col: torch.tensor(int(current_row.get(col, 0)), dtype=torch.long)
+                     for col in self.static_cat_cols if col in current_row.index}
+        static_num_vals = [float(current_row.get(col, 0)) for col in self.static_num_cols]
+        static_num = torch.tensor(static_num_vals, dtype=torch.float32) if static_num_vals else torch.zeros(1)
+
+        return {
+            'vitals': torch.from_numpy(vitals),
+            'meds': torch.from_numpy(meds),
+            'gases': torch.from_numpy(gases),
+            'bolus': torch.from_numpy(bolus),
+            'last_input_bolus': torch.from_numpy(bolus_values),
+            'attention_mask': torch.from_numpy(attention_mask),
+            'target': torch.from_numpy(target),
+            'static_cat': static_cat,
+            'static_num': static_num,
+            'patient_id': torch.tensor(hash(cid) % (2**31), dtype=torch.long),
+            'mpog_case_id': cid,
+            'last5_bp_values': torch.from_numpy(np.array(last5_bp, dtype=np.float16)),
+            'last_known_bp': torch.tensor(last5_bp[-1], dtype=torch.float32),
+            'hypo_onset_label': torch.tensor(hypo_onset_label, dtype=torch.float32),
+            'hypo_onset_type': hypo_onset_type,
+            'actual_sequence_length': torch.tensor(seq_len, dtype=torch.long),
+            'prediction_timestep': torch.tensor(end, dtype=torch.long),
+        }
+
+    @staticmethod
+    def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Same collate function as IntraOpDataset."""
+        return IntraOpDataset.collate_fn(batch)
