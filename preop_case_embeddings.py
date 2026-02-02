@@ -37,8 +37,6 @@ import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
 from sklearn.decomposition import PCA, TruncatedSVD
-from sklearn.impute import SimpleImputer
-from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler, normalize
 
 # Configure logging
@@ -539,6 +537,22 @@ class PreopCaseEmbedder:
         df[self.config.id_col] = df[self.config.id_col].astype(str)
         df = df.set_index(self.config.id_col).loc[case_ids].reset_index()
 
+        # Fill NaN with placeholders (no imputation)
+        # Numerical: fill with 0
+        for col in num_cols:
+            if col in df.columns:
+                df[col] = df[col].fillna(0).astype(float)
+
+        # Categorical: fill with "Unknown" category
+        for col in cat_cols:
+            if col in df.columns:
+                df[col] = df[col].fillna("Unknown").astype(str)
+
+        # Binary: fill with 0
+        for col in bin_cols:
+            if col in df.columns:
+                df[col] = df[col].fillna(0).astype(float)
+
         # Build preprocessing pipeline
         if self._structured_pipeline is None:
             transformers = []
@@ -547,12 +561,7 @@ class PreopCaseEmbedder:
                 transformers.append(
                     (
                         "num",
-                        Pipeline(
-                            [
-                                ("impute", SimpleImputer(strategy="median")),
-                                ("scale", StandardScaler()),
-                            ]
-                        ),
+                        StandardScaler(),
                         num_cols,
                     )
                 )
@@ -561,17 +570,7 @@ class PreopCaseEmbedder:
                 transformers.append(
                     (
                         "cat",
-                        Pipeline(
-                            [
-                                ("impute", SimpleImputer(strategy="most_frequent")),
-                                (
-                                    "onehot",
-                                    OneHotEncoder(
-                                        handle_unknown="ignore", sparse_output=False
-                                    ),
-                                ),
-                            ]
-                        ),
+                        OneHotEncoder(handle_unknown="ignore", sparse_output=False),
                         cat_cols,
                     )
                 )
@@ -580,11 +579,7 @@ class PreopCaseEmbedder:
                 transformers.append(
                     (
                         "bin",
-                        Pipeline(
-                            [
-                                ("impute", SimpleImputer(strategy="constant", fill_value=0)),
-                            ]
-                        ),
+                        "passthrough",
                         bin_cols,
                     )
                 )
