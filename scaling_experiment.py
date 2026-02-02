@@ -135,6 +135,59 @@ def build_vocab(df: pd.DataFrame, categorical_cols: list) -> dict:
     return vocabs
 
 
+@torch.no_grad()
+def evaluate(model, loader, config, device):
+    """Simple evaluation function - computes loss and MSE."""
+    model.eval()
+    total_loss = 0.0
+    total_mse = 0.0
+    n_batches = 0
+
+    for batch in loader:
+        # Move to device
+        vitals = batch["vitals"].to(device, dtype=torch.float32)
+        meds = batch["meds"].to(device, dtype=torch.float32)
+        gases = batch["gases"].to(device, dtype=torch.float32)
+        bolus = batch["bolus"].to(device, dtype=torch.float32)
+        attention_mask = batch["attention_mask"].to(device, dtype=torch.bool)
+        targets = batch["target"].to(device, dtype=torch.float32)
+
+        static_cat = batch.get("static_cat")
+        if static_cat is not None:
+            static_cat = {k: v.to(device) for k, v in static_cat.items()}
+        static_num = batch.get("static_num")
+        if static_num is not None:
+            static_num = static_num.to(device, dtype=torch.float32)
+
+        # Forward pass
+        preds, _, _ = model(
+            vitals=vitals,
+            meds=meds,
+            gases=gases,
+            bolus=bolus,
+            attention_mask=attention_mask,
+            static_cat=static_cat,
+            static_num=static_num,
+            future_steps=config["future_steps"],
+        )
+
+        # Compute MSE
+        mse = torch.nn.functional.mse_loss(preds, targets)
+        total_mse += mse.item()
+        total_loss += mse.item()  # Using MSE as loss for simplicity
+        n_batches += 1
+
+    model.train()
+
+    if n_batches == 0:
+        return {"loss": 0.0, "mse": 0.0}
+
+    return {
+        "loss": total_loss / n_batches,
+        "mse": total_mse / n_batches,
+    }
+
+
 def main():
     args = parse_args()
 
@@ -240,7 +293,6 @@ def main():
     from intraop_dataset import IntraOpDataset
     from model import IntraOpPredictor
     from train_autoreg import train_autoreg_epoch
-    from eval_autoreg import eval_autoreg
 
     # Create datasets
     print("\n" + "=" * 60)
@@ -359,7 +411,7 @@ def main():
         )
 
         # Validate
-        val_metrics = eval_autoreg(
+        val_metrics = evaluate(
             model=model,
             loader=val_loader,
             config=config,
@@ -408,7 +460,7 @@ def main():
     checkpoint = torch.load(output_dir / "best_model.pt", map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
 
-    test_metrics = eval_autoreg(
+    test_metrics = evaluate(
         model=model,
         loader=test_loader,
         config=config,
