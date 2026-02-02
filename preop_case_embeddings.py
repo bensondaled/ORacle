@@ -36,7 +36,7 @@ import duckdb
 import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
-from sklearn.decomposition import PCA, TruncatedSVD
+from sklearn.decomposition import IncrementalPCA
 from sklearn.preprocessing import OneHotEncoder, StandardScaler, normalize
 
 # Configure logging
@@ -282,9 +282,11 @@ class PreopCaseEmbedder:
 
         # Will be initialized lazily
         self._text_embedder: Optional[TextEmbedder] = None
-        self._medication_pca: Optional[PCA] = None
+        self._medication_pca: Optional[IncrementalPCA] = None
+        self._medication_pca_fitted: bool = False
         self._structured_pipeline: Optional[ColumnTransformer] = None
-        self._structured_svd: Optional[TruncatedSVD] = None
+        self._structured_svd: Optional[IncrementalPCA] = None
+        self._structured_svd_fitted: bool = False
 
         # Cache table names
         self._caseinfo_table: Optional[str] = None
@@ -463,17 +465,20 @@ class PreopCaseEmbedder:
         embedder = self._get_text_embedder()
         X_full = embedder.encode(med_texts, batch_size=self.config.embed_batch_size)
 
-        # Reduce to target dimension via PCA
+        # Reduce to target dimension via IncrementalPCA
         if self._medication_pca is None:
-            logger.info(
-                f"Fitting medication PCA: {X_full.shape[1]} -> {self.config.medication_dim}"
-            )
             n_components = min(
-                self.config.medication_dim, X_full.shape[0] - 1, X_full.shape[1]
+                self.config.medication_dim, X_full.shape[1]
             )
-            self._medication_pca = PCA(n_components=n_components, random_state=42)
-            X_reduced = self._medication_pca.fit_transform(X_full)
+            self._medication_pca = IncrementalPCA(n_components=n_components)
+
+        if not self._medication_pca_fitted:
+            # Partial fit (accumulate statistics)
+            self._medication_pca.partial_fit(X_full)
+            # Return placeholder - will transform in second pass
+            X_reduced = np.zeros((len(case_ids), self.config.medication_dim), dtype=np.float32)
         else:
+            # Transform using fitted PCA
             X_reduced = self._medication_pca.transform(X_full)
 
         # Pad if needed
@@ -494,7 +499,7 @@ class PreopCaseEmbedder:
         Embed structured clinical features for given cases.
 
         Processes numerical, categorical, and binary features,
-        then reduces to 96 dims via TruncatedSVD.
+        then reduces to 96 dims via IncrementalPCA.
 
         Args:
             case_ids: List of case IDs
@@ -624,23 +629,28 @@ class PreopCaseEmbedder:
             X_raw = self._structured_pipeline.fit_transform(df)
             logger.info(f"  Raw structured features: {X_raw.shape}")
 
-            # Fit SVD
+            # Initialize IncrementalPCA for dimension reduction
             n_components = min(
-                self.config.structured_dim, X_raw.shape[1] - 1, X_raw.shape[0] - 1
+                self.config.structured_dim, X_raw.shape[1]
             )
             if n_components > 1:
-                self._structured_svd = TruncatedSVD(
-                    n_components=n_components, random_state=42
-                )
-                X_reduced = self._structured_svd.fit_transform(X_raw)
-            else:
-                X_reduced = X_raw
-        else:
+                self._structured_svd = IncrementalPCA(n_components=n_components)
+
+        # Transform with pipeline
+        if self._structured_pipeline is not None:
             X_raw = self._structured_pipeline.transform(df)
-            if self._structured_svd is not None:
-                X_reduced = self._structured_svd.transform(X_raw)
-            else:
-                X_reduced = X_raw
+
+        # Handle dimension reduction
+        if self._structured_svd is None:
+            X_reduced = X_raw
+        elif not self._structured_svd_fitted:
+            # Partial fit (accumulate statistics)
+            self._structured_svd.partial_fit(X_raw)
+            # Return placeholder - will transform in second pass
+            X_reduced = np.zeros((len(case_ids), self.config.structured_dim), dtype=np.float32)
+        else:
+            # Transform using fitted PCA
+            X_reduced = self._structured_svd.transform(X_raw)
 
         # Pad if needed
         if X_reduced.shape[1] < self.config.structured_dim:
@@ -721,18 +731,60 @@ class PreopCaseEmbedder:
             all_case_ids = case_ids
 
         n_cases = len(all_case_ids)
+        total_batches = (n_cases + batch_size - 1) // batch_size
         logger.info(f"Processing {n_cases:,} cases in batches of {batch_size:,}")
 
-        # Process in batches
-        results = []
         t_start = time.time()
+
+        # =================================================================
+        # PASS 1: Fit IncrementalPCA on all batches
+        # =================================================================
+        logger.info("=" * 60)
+        logger.info("PASS 1: Fitting dimension reducers on all data...")
+        logger.info("=" * 60)
 
         for batch_idx, i in enumerate(range(0, n_cases, batch_size)):
             batch_ids = all_case_ids[i : i + batch_size]
             batch_num = batch_idx + 1
-            total_batches = (n_cases + batch_size - 1) // batch_size
 
-            logger.info(f"Batch {batch_num}/{total_batches}: cases {i:,} to {i+len(batch_ids):,}")
+            logger.info(f"Fit batch {batch_num}/{total_batches}: cases {i:,} to {i+len(batch_ids):,}")
+
+            # Call embed methods - they will partial_fit
+            _ = self.embed_medications(batch_ids)
+            _ = self.embed_structured(batch_ids)
+
+            # Log progress
+            elapsed = time.time() - t_start
+            cases_done = i + len(batch_ids)
+            rate = cases_done / elapsed if elapsed > 0 else 0
+
+            logger.info(
+                f"  Fit progress: {cases_done:,}/{n_cases:,} cases "
+                f"({cases_done/n_cases*100:.1f}%) - {rate:.0f} cases/s"
+            )
+
+            gc.collect()
+
+        # Mark as fitted - next calls will transform
+        self._medication_pca_fitted = True
+        self._structured_svd_fitted = True
+        logger.info("Dimension reducers fitted on all data!")
+
+        # =================================================================
+        # PASS 2: Transform all batches and collect results
+        # =================================================================
+        logger.info("=" * 60)
+        logger.info("PASS 2: Generating embeddings...")
+        logger.info("=" * 60)
+
+        results = []
+        t_pass2 = time.time()
+
+        for batch_idx, i in enumerate(range(0, n_cases, batch_size)):
+            batch_ids = all_case_ids[i : i + batch_size]
+            batch_num = batch_idx + 1
+
+            logger.info(f"Transform batch {batch_num}/{total_batches}: cases {i:,} to {i+len(batch_ids):,}")
 
             # Get embeddings and procedure text
             X_proc, texts = self.embed_procedures(batch_ids, return_texts=True)
@@ -758,9 +810,9 @@ class PreopCaseEmbedder:
             results.append(batch_df)
 
             # Log progress
-            elapsed = time.time() - t_start
+            elapsed = time.time() - t_pass2
             cases_done = i + len(batch_ids)
-            rate = cases_done / elapsed
+            rate = cases_done / elapsed if elapsed > 0 else 0
             eta = (n_cases - cases_done) / rate if rate > 0 else 0
 
             logger.info(
@@ -797,10 +849,10 @@ class PreopCaseEmbedder:
 
     def fit_reducers(self, sample_size: int = 50000) -> None:
         """
-        Pre-fit PCA and SVD reducers on a sample of data.
+        Pre-fit IncrementalPCA reducers on a sample of data.
 
-        This is useful for consistent dimensionality reduction
-        across multiple batches.
+        Note: process_all() automatically fits on ALL data using two passes.
+        This method is only needed if you want to fit on a subset first.
 
         Args:
             sample_size: Number of cases to use for fitting
@@ -810,9 +862,13 @@ class PreopCaseEmbedder:
         # Get sample case IDs
         case_ids = self.get_case_ids(limit=sample_size)
 
-        # Fit by running embed methods (they fit on first call)
+        # Partial fit by running embed methods
         _ = self.embed_medications(case_ids)
         _ = self.embed_structured(case_ids)
+
+        # Mark as fitted so transforms work
+        self._medication_pca_fitted = True
+        self._structured_svd_fitted = True
 
         logger.info("Reducers fitted")
 
