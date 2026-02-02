@@ -537,21 +537,31 @@ class PreopCaseEmbedder:
         df[self.config.id_col] = df[self.config.id_col].astype(str)
         df = df.set_index(self.config.id_col).loc[case_ids].reset_index()
 
-        # Fill NaN with placeholders (no imputation)
-        # Numerical: fill with 0
+        # Handle missing values by adding indicator columns (no imputation)
+        # This preserves missingness info for the model
+
+        missing_cols = []
+
+        # Numerical: add _missing indicator, fill with 0
         for col in num_cols:
             if col in df.columns:
+                miss_col = f"{col}_missing"
+                df[miss_col] = df[col].isna().astype(float)
                 df[col] = df[col].fillna(0).astype(float)
+                missing_cols.append(miss_col)
 
-        # Categorical: fill with "Unknown" category
+        # Categorical: fill with "Unknown" (becomes its own one-hot category)
         for col in cat_cols:
             if col in df.columns:
                 df[col] = df[col].fillna("Unknown").astype(str)
 
-        # Binary: fill with 0
+        # Binary: add _missing indicator, fill with 0
         for col in bin_cols:
             if col in df.columns:
+                miss_col = f"{col}_missing"
+                df[miss_col] = df[col].isna().astype(float)
                 df[col] = df[col].fillna(0).astype(float)
+                missing_cols.append(miss_col)
 
         # Build preprocessing pipeline
         if self._structured_pipeline is None:
@@ -581,6 +591,15 @@ class PreopCaseEmbedder:
                         "bin",
                         "passthrough",
                         bin_cols,
+                    )
+                )
+
+            if missing_cols:
+                transformers.append(
+                    (
+                        "missing",
+                        "passthrough",
+                        missing_cols,
                     )
                 )
 
