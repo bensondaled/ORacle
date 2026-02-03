@@ -633,9 +633,10 @@ class StreamingIntraOpDataset(torch.utils.data.IterableDataset):
                 continue
 
     def _process_file(self, file_path: str, seed: int):
-        """Load a file and yield all samples from it."""
+        """Load a file and yield all samples from it. OPTIMIZED."""
         # Load file
         df = pd.read_feather(file_path)
+        logger.info(f"  Loading {Path(file_path).name}: {len(df):,} rows")
 
         # Debug mode: sample cases
         if self.debug_frac is not None and self.debug_frac < 1.0:
@@ -653,33 +654,49 @@ class StreamingIntraOpDataset(torch.utils.data.IterableDataset):
             if col in df.columns and col in self.vocab_maps:
                 df[col] = df[col].map(self.vocab_maps[col]).fillna(0).astype(int)
 
-        # Filter valid cases
-        grouped = df.groupby('mpog_case_id')
+        # OPTIMIZED: Filter valid cases using groupby.size() instead of get_group()
         min_len = self.future_steps + 1
-        valid_case_ids = [cid for cid in grouped.groups.keys()
-                         if len(grouped.get_group(cid)) >= min_len]
+        group_sizes = df.groupby('mpog_case_id').size()
+        valid_case_ids = group_sizes[group_sizes >= min_len].index
 
-        if not valid_case_ids:
+        if len(valid_case_ids) == 0:
             return
 
         df = df[df['mpog_case_id'].isin(valid_case_ids)]
-        grouped = df.groupby('mpog_case_id')
 
-        # Generate samples
+        # OPTIMIZED: Sort and compute case boundaries
+        df = df.sort_values(['mpog_case_id']).reset_index(drop=True)
+        case_ids_array = df['mpog_case_id'].values
+        case_boundaries = {}
+        current_case = None
+        start_idx = 0
+
+        for i, cid in enumerate(case_ids_array):
+            if cid != current_case:
+                if current_case is not None:
+                    case_boundaries[current_case] = (start_idx, i)
+                current_case = cid
+                start_idx = i
+        if current_case is not None:
+            case_boundaries[current_case] = (start_idx, len(case_ids_array))
+
+        # Generate samples using boundaries
         samples = []
         stride = self.config.get('stride', 1)
         required_past_steps = self.config.get('min_history_steps', 5)
 
-        for cid in grouped.groups.keys():
-            group = grouped.get_group(cid)
-            num_rows = len(group)
+        for cid, (case_start, case_end) in case_boundaries.items():
+            num_rows = case_end - case_start
             max_end = num_rows - self.future_steps + 1
 
             if max_end <= required_past_steps:
                 continue
 
             for end in range(required_past_steps, max_end, stride):
-                samples.append((cid, end, group))
+                # Store (case_id, sample_end_idx, case_start_in_df, case_end_in_df)
+                samples.append((cid, end, case_start, case_end))
+
+        logger.info(f"    Generated {len(samples):,} samples from {len(case_boundaries)} cases")
 
         # Shuffle samples within file
         if self.shuffle_samples:
@@ -687,9 +704,11 @@ class StreamingIntraOpDataset(torch.utils.data.IterableDataset):
             rng.shuffle(samples)
 
         # Yield each sample
-        for cid, end, group in samples:
+        for cid, end, case_start, case_end in samples:
             try:
-                yield self._get_sample(cid, end, group)
+                # Get case data using boundaries
+                case_df = df.iloc[case_start:case_end]
+                yield self._get_sample(cid, end, case_df)
             except Exception as e:
                 continue  # Skip bad samples silently
 
