@@ -218,6 +218,54 @@ def get_institution_file_paths(
     return file_paths
 
 
+def select_one_per_region_for_val(
+    selected_institutions: List[int],
+    seed: int = 42,
+) -> Tuple[List[int], List[int]]:
+    """
+    Select 1 institution per region for validation, rest for training.
+
+    Args:
+        selected_institutions: List of selected institution IDs
+        seed: Random seed
+
+    Returns:
+        (train_institutions, val_institutions)
+    """
+    np.random.seed(seed)
+
+    # Group selected by region
+    by_region = {r: [] for r in REGIONS}
+    for inst_id in selected_institutions:
+        if inst_id in INSTITUTION_METADATA:
+            region = INSTITUTION_METADATA[inst_id][0]
+            by_region[region].append(inst_id)
+
+    # Select 1 random institution per region for validation
+    val_institutions = []
+    train_institutions = []
+
+    for region in REGIONS:
+        insts = by_region[region]
+        if len(insts) > 0:
+            # Pick one random for validation
+            val_idx = np.random.randint(len(insts))
+            val_inst = insts[val_idx]
+            val_institutions.append(val_inst)
+            # Rest go to training
+            train_institutions.extend([i for i in insts if i != val_inst])
+        # If region has no institutions in selection, skip
+
+    print(f"Train institutions: {len(train_institutions)} ({len(selected_institutions) - len(val_institutions)} after val split)")
+    print(f"Val institutions: {len(val_institutions)} (1 per region)")
+    for region in REGIONS:
+        val_in_region = [i for i in val_institutions if INSTITUTION_METADATA.get(i, (None,))[0] == region]
+        if val_in_region:
+            print(f"  {region}: {val_in_region[0]}")
+
+    return train_institutions, val_institutions
+
+
 def load_institutions_data(
     data_dir: str,
     institution_ids: List[int],

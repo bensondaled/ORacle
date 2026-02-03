@@ -173,16 +173,44 @@ class IntraOpDataset(Dataset):
                 logger.warning(f"Skipping static categorical column {col}: missing in df or vocabs")
 
         # Filter cases with sufficient length for early prediction
-        grouped = self.df.groupby('mpog_case_id')
-        # Changed: minimum length is just future_steps + 1 (to predict from t=1)
+        # OPTIMIZED: Use groupby.size() instead of iterating with get_group()
         min_len = self.future_steps + 1
-        logger.info(f"🔍 Before filtering: {len(grouped.groups)} cases, min_len required: {min_len}")
-        valid_case_ids = [cid for cid in grouped.groups.keys() if len(grouped.get_group(cid)) >= min_len]
-        logger.info(f"🔍 After filtering: {len(valid_case_ids)} valid cases")
-        self.df = self.df[self.df['mpog_case_id'].isin(valid_case_ids)].copy()
-        logger.info(f"🔍 After DataFrame filter: df has {len(self.df)} rows, {self.df['mpog_case_id'].nunique()} unique cases")
-        self.grouped = self.df.groupby('mpog_case_id')
-        logger.info(f"🔍 Final grouped object has {len(self.grouped.groups)} groups")
+        logger.info(f"🔍 Filtering cases (min_len={min_len})...")
+
+        # Fast: get all group sizes at once
+        group_sizes = self.df.groupby('mpog_case_id').size()
+        n_total_cases = len(group_sizes)
+
+        # Fast: filter by size
+        valid_case_ids = group_sizes[group_sizes >= min_len].index
+        n_valid_cases = len(valid_case_ids)
+        logger.info(f"🔍 Valid cases: {n_valid_cases:,}/{n_total_cases:,} ({n_valid_cases/n_total_cases*100:.1f}%)")
+
+        # Filter DataFrame
+        self.df = self.df[self.df['mpog_case_id'].isin(valid_case_ids)]
+        logger.info(f"🔍 Filtered DataFrame: {len(self.df):,} rows")
+
+        # OPTIMIZED: Pre-compute case boundaries for fast sample generation
+        # Sort by case_id for efficient indexing
+        self.df = self.df.sort_values(['mpog_case_id']).reset_index(drop=True)
+
+        # Compute start/end indices for each case
+        case_ids_array = self.df['mpog_case_id'].values
+        case_boundaries = {}
+        current_case = None
+        start_idx = 0
+
+        for i, cid in enumerate(case_ids_array):
+            if cid != current_case:
+                if current_case is not None:
+                    case_boundaries[current_case] = (start_idx, i)
+                current_case = cid
+                start_idx = i
+        if current_case is not None:
+            case_boundaries[current_case] = (start_idx, len(case_ids_array))
+
+        self.case_boundaries = case_boundaries
+        logger.info(f"🔍 Indexed {len(case_boundaries):,} cases")
 
         all_samples = self._generate_samples()
 
@@ -196,53 +224,54 @@ class IntraOpDataset(Dataset):
         logger.info(f"📦 Generated {len(self.samples)} samples across {unique_cases_in_samples} cases")
 
     def _generate_samples(self) -> List[Tuple[str, int]]:
+        """Generate (case_id, end_idx) samples. OPTIMIZED using pre-computed boundaries."""
         samples = []
         stride = self.config.get('stride', 1)
-        required_past_steps = self.config.get('min_history_steps', 5)  # Configurable minimum history
-        
-        case_ids = list(self.grouped.groups.keys())
-        logger.info(f"🔍 Processing {len(case_ids)} case IDs for sample generation")
-        
-        cases_with_samples = set()
+        required_past_steps = self.config.get('min_history_steps', 5)
+
+        case_ids = list(self.case_boundaries.keys())
+        n_cases = len(case_ids)
+        logger.info(f"🔍 Generating samples for {n_cases:,} cases (stride={stride})...")
+
+        # OPTIMIZED: Use pre-computed boundaries, no get_group() calls
         for i, cid in enumerate(case_ids):
-            # Progress logging every 10k cases
-            if i % 10000 == 0:
-                logger.info(f"🔍 Processing case {i+1}/{len(case_ids)}")
-                
-            group = self.grouped.get_group(cid)
-            num_rows = len(group)
+            start_idx, end_idx = self.case_boundaries[cid]
+            num_rows = end_idx - start_idx
             max_end = num_rows - self.future_steps + 1
-            
+
             if max_end <= required_past_steps:
                 continue
 
-            # OPTIMIZED: Generate all sample endpoints at once
-            case_samples_count = 0
+            # Generate sample indices
             for end in range(required_past_steps, max_end, stride):
-                # OPTIMIZED: Skip expensive row access during sample generation
                 samples.append((cid, end))
-                case_samples_count += 1
-            
-            if case_samples_count > 0:
-                cases_with_samples.add(cid)
-        
-        logger.info(f"🔍 Generated samples for {len(cases_with_samples)} unique cases")
+
+            # Progress logging every 50k cases
+            if (i + 1) % 50000 == 0:
+                logger.info(f"🔍 Processed {i+1:,}/{n_cases:,} cases, {len(samples):,} samples so far")
+
+        logger.info(f"🔍 Generated {len(samples):,} total samples")
         return samples
+
+    def _get_case_data(self, cid: str) -> pd.DataFrame:
+        """Get data for a case using pre-computed boundaries. OPTIMIZED."""
+        case_start, case_end = self.case_boundaries[cid]
+        return self.df.iloc[case_start:case_end]
 
     def _balance_hypo_samples(self, samples, ratio=1.0):
         pos, neg = [], []
-        
+
         for cid, end in samples:
-            group = self.grouped.get_group(cid)
+            group = self._get_case_data(cid)
             start = max(0, end - self.max_len)
             window = group.iloc[start:end]
-            
+
             # Get label from the last timestep in window
             if len(window) > 0:
                 label = float(window.iloc[-1].get("hypo_onset_label", 0))
             else:
                 label = 0.0
-                
+
             if label == 1:
                 pos.append((cid, end))
             else:
@@ -256,14 +285,14 @@ class IntraOpDataset(Dataset):
         else:
             # If no positive samples, take all negative samples
             balanced_samples = neg
-            
+
         logger.info(f"Balanced samples: {len(pos)} positive, {len(neg_sampled) if len(pos) > 0 else len(neg)} negative")
         return balanced_samples
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         cid, end = self.samples[idx]
-        group = self.grouped.get_group(cid)
-        
+        group = self._get_case_data(cid)  # OPTIMIZED: Use pre-computed boundaries
+
         # Calculate window boundaries
         start = max(0, end - self.max_len)
         window = group.iloc[start:end]
