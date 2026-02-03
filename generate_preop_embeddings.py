@@ -106,6 +106,12 @@ def parse_args() -> argparse.Namespace:
         default=256,
         help="Number of texts per embedding batch (default: 256)",
     )
+    parser.add_argument(
+        "--pca-fit-batches",
+        type=int,
+        default=10,
+        help="Number of batches to fit PCA on (default: 10 = 100k cases)",
+    )
 
     # Debug/subset options
     parser.add_argument(
@@ -271,6 +277,7 @@ def main():
     logger.info(f"  Batch size: {args.batch_size}")
     logger.info(f"  Dimensions: proc={args.proc_dim}, med={args.med_dim}, struct={args.struct_dim}")
     logger.info(f"  Total dimension: {args.proc_dim + args.med_dim + args.struct_dim}")
+    logger.info(f"  PCA fit batches: {args.pca_fit_batches} ({args.pca_fit_batches * args.batch_size:,} cases)")
 
     # Check database paths exist
     if not os.path.exists(args.caseinfo_db):
@@ -319,6 +326,7 @@ def main():
         batch_size=args.batch_size,
         debug_frac=debug_frac,
         case_ids=case_ids,
+        pca_fit_batches=args.pca_fit_batches,
     )
     total_time = time.time() - t_start
 

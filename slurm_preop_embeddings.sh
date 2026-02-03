@@ -47,6 +47,9 @@ if [ "${DEBUG:-0}" = "1" ]; then
     OUTPUT_FILE="${OUTPUT_DIR}/preop_embeddings_debug.parquet"
 fi
 
+# PCA fitting batches (default 10 = 100k cases)
+PCA_FIT_BATCHES="${PCA_FIT_BATCHES:-10}"
+
 # -----------------------------
 # Environment
 # -----------------------------
@@ -153,6 +156,7 @@ ${POETRY} run python -u "${ORACLE_DIR}/generate_preop_embeddings.py" \
     --output "${OUTPUT_FILE}" \
     --batch-size 10000 \
     --embed-batch-size 256 \
+    --pca-fit-batches "${PCA_FIT_BATCHES}" \
     --verify \
     ${DEBUG_FLAG}
 
