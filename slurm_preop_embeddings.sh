@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH --job-name=preop_emb
 #SBATCH --partition=gpu
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:v100:1
 #SBATCH --mem=64G
 #SBATCH --cpus-per-task=8
-#SBATCH --time=8:00:00
+#SBATCH --time=24:00:00
 #SBATCH --output=/home/%u/logs/preop_emb_%j.out
 #SBATCH --error=/home/%u/logs/preop_emb_%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL

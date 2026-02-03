@@ -413,81 +413,27 @@ class PreopCaseEmbedder:
         Concatenates all medication text per case, embeds with BGE,
         then reduces to 64 dims via PCA.
 
+        Note: PCA must be fitted before calling this (via _embed_medications_raw
+        and partial_fit during process_all).
+
         Args:
             case_ids: List of case IDs
 
         Returns:
             numpy array of shape (n_cases, 64)
         """
-        logger.info(f"Embedding medications for {len(case_ids):,} cases")
+        # Get raw embeddings
+        X_full = self._embed_medications_raw(case_ids)
 
-        con = connect_db(self.meds_db)
-        try:
-            table = self._get_meds_table(con)
-            cols = get_columns(con, table)
+        # Reduce via PCA (must be fitted)
+        if self._medication_pca is None or not self._medication_pca_fitted:
+            logger.warning("Medication PCA not fitted, returning zeros")
+            return np.zeros((len(case_ids), self.config.medication_dim), dtype=np.float32)
 
-            # Find text column
-            text_col = next((c for c in cols if "text" in c.lower()), None)
-            if text_col is None:
-                logger.warning("No medication text column found, using zeros")
-                return np.zeros(
-                    (len(case_ids), self.config.medication_dim), dtype=np.float32
-                )
-
-            # Aggregate medication text per case
-            df = con.execute(
-                f"""
-                SELECT "{self.config.id_col}",
-                       STRING_AGG("{text_col}", ', ') AS med_text
-                FROM {table}
-                WHERE "{self.config.id_col}" IN (SELECT * FROM UNNEST(?))
-                GROUP BY "{self.config.id_col}"
-                """,
-                [case_ids],
-            ).fetchdf()
-        finally:
-            con.close()
-
-        # Create mapping of case_id -> med_text
-        df[self.config.id_col] = df[self.config.id_col].astype(str)
-        med_dict = dict(zip(df[self.config.id_col], df["med_text"]))
-
-        # Get medication text for each case (in order)
-        med_texts = []
-        for cid in case_ids:
-            text = med_dict.get(cid, "")
-            text = clean_text(text, max_chars=1024)  # Allow longer for med lists
-            if not text:
-                text = "no medications"
-            med_texts.append(text)
-
-        # Embed medication texts
-        embedder = self._get_text_embedder()
-        X_full = embedder.encode(med_texts, batch_size=self.config.embed_batch_size)
-
-        # Reduce to target dimension via IncrementalPCA
-        if self._medication_pca is None:
-            n_components = min(
-                self.config.medication_dim, X_full.shape[1]
-            )
-            self._medication_pca = IncrementalPCA(n_components=n_components)
-
-        if not self._medication_pca_fitted:
-            # Partial fit (accumulate statistics)
-            self._medication_pca.partial_fit(X_full)
-            # Return placeholder - will transform in second pass
-            X_reduced = np.zeros((len(case_ids), self.config.medication_dim), dtype=np.float32)
-        else:
-            # Transform using fitted PCA
-            X_reduced = self._medication_pca.transform(X_full)
+        X_reduced = self._medication_pca.transform(X_full)
 
         # Pad if needed
-        if X_reduced.shape[1] < self.config.medication_dim:
-            padding = np.zeros(
-                (X_reduced.shape[0], self.config.medication_dim - X_reduced.shape[1]),
-                dtype=np.float32,
-            )
-            X_reduced = np.hstack([X_reduced, padding])
+        X_reduced = self._pad_to_dim(X_reduced, self.config.medication_dim)
 
         # L2 normalize
         X_reduced = normalize(X_reduced, norm="l2").astype(np.float32)
@@ -501,164 +447,29 @@ class PreopCaseEmbedder:
         Processes numerical, categorical, and binary features,
         then reduces to 96 dims via IncrementalPCA.
 
+        Note: SVD must be fitted before calling this (via _get_structured_raw
+        and partial_fit during process_all).
+
         Args:
             case_ids: List of case IDs
 
         Returns:
             numpy array of shape (n_cases, 96)
         """
-        logger.info(f"Embedding structured features for {len(case_ids):,} cases")
+        # Get raw features
+        X_raw = self._get_structured_raw(case_ids)
 
-        con = connect_db(self.caseinfo_db)
-        try:
-            table = self._get_caseinfo_table(con)
-            existing_cols = set(get_columns(con, table))
-
-            # Collect columns to fetch
-            all_cols = [self.config.id_col]
-            num_cols = [c for c in self.config.numerical_cols if c in existing_cols]
-            cat_cols = [c for c in self.config.categorical_cols if c in existing_cols]
-            bin_cols = [c for c in self.config.comorbidity_cols if c in existing_cols]
-
-            all_cols.extend(num_cols + cat_cols + bin_cols)
-
-            logger.info(
-                f"  Using {len(num_cols)} numerical, "
-                f"{len(cat_cols)} categorical, "
-                f"{len(bin_cols)} binary features"
-            )
-
-            # Fetch data
-            col_sql = ", ".join([f'"{c}"' for c in all_cols])
-            df = con.execute(
-                f"SELECT {col_sql} FROM {table} "
-                f'WHERE "{self.config.id_col}" IN (SELECT * FROM UNNEST(?))',
-                [case_ids],
-            ).fetchdf()
-        finally:
-            con.close()
-
-        # Reorder to match input case_ids
-        df[self.config.id_col] = df[self.config.id_col].astype(str)
-        df = df.set_index(self.config.id_col).loc[case_ids].reset_index()
-
-        # Handle missing values by adding indicator columns (no imputation)
-        # This preserves missingness info for the model
-
-        missing_cols = []
-
-        # Numerical: add _missing indicator, fill with 0
-        for col in num_cols:
-            if col in df.columns:
-                miss_col = f"{col}_missing"
-                # Convert to numeric first (handles any string values)
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-                df[miss_col] = df[col].isna().astype(float)
-                df[col] = df[col].fillna(0).astype(float)
-                missing_cols.append(miss_col)
-
-        # Categorical: fill with "Unknown" (becomes its own one-hot category)
-        for col in cat_cols:
-            if col in df.columns:
-                df[col] = df[col].fillna("Unknown").astype(str)
-
-        # Binary: convert Yes/No strings to 1/0, add _missing indicator
-        for col in bin_cols:
-            if col in df.columns:
-                miss_col = f"{col}_missing"
-                df[miss_col] = df[col].isna().astype(float)
-                # Convert to string first, then replace Yes/No with 1/0
-                df[col] = df[col].astype(str).str.lower()
-                df[col] = df[col].replace({
-                    "yes": "1", "true": "1",
-                    "no": "0", "false": "0",
-                    "nan": "0", "none": "0", "<na>": "0", "": "0"
-                })
-                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(float)
-                missing_cols.append(miss_col)
-
-        # Build preprocessing pipeline
-        if self._structured_pipeline is None:
-            transformers = []
-
-            if num_cols:
-                transformers.append(
-                    (
-                        "num",
-                        StandardScaler(),
-                        num_cols,
-                    )
-                )
-
-            if cat_cols:
-                transformers.append(
-                    (
-                        "cat",
-                        OneHotEncoder(handle_unknown="ignore", sparse_output=False),
-                        cat_cols,
-                    )
-                )
-
-            if bin_cols:
-                transformers.append(
-                    (
-                        "bin",
-                        "passthrough",
-                        bin_cols,
-                    )
-                )
-
-            if missing_cols:
-                transformers.append(
-                    (
-                        "missing",
-                        "passthrough",
-                        missing_cols,
-                    )
-                )
-
-            if not transformers:
-                logger.warning("No structured features available")
-                return np.zeros(
-                    (len(case_ids), self.config.structured_dim), dtype=np.float32
-                )
-
-            self._structured_pipeline = ColumnTransformer(
-                transformers, remainder="drop"
-            )
-            X_raw = self._structured_pipeline.fit_transform(df)
-            logger.info(f"  Raw structured features: {X_raw.shape}")
-
-            # Initialize IncrementalPCA for dimension reduction
-            n_components = min(
-                self.config.structured_dim, X_raw.shape[1]
-            )
-            if n_components > 1:
-                self._structured_svd = IncrementalPCA(n_components=n_components)
-
-        # Transform with pipeline
-        if self._structured_pipeline is not None:
-            X_raw = self._structured_pipeline.transform(df)
-
-        # Handle dimension reduction
+        # Reduce via SVD if available
         if self._structured_svd is None:
             X_reduced = X_raw
         elif not self._structured_svd_fitted:
-            # Partial fit (accumulate statistics)
-            self._structured_svd.partial_fit(X_raw)
-            # Return placeholder - will transform in second pass
-            X_reduced = np.zeros((len(case_ids), self.config.structured_dim), dtype=np.float32)
+            logger.warning("Structured SVD not fitted, returning padded raw")
+            X_reduced = X_raw
         else:
-            # Transform using fitted PCA
             X_reduced = self._structured_svd.transform(X_raw)
 
         # Pad if needed
-        if X_reduced.shape[1] < self.config.structured_dim:
-            padding = np.zeros(
-                (X_reduced.shape[0], self.config.structured_dim - X_reduced.shape[1]),
-                dtype=np.float32,
-            )
-            X_reduced = np.hstack([X_reduced, padding])
+        X_reduced = self._pad_to_dim(X_reduced, self.config.structured_dim)
 
         # L2 normalize
         X_reduced = normalize(X_reduced, norm="l2").astype(np.float32)
@@ -705,19 +516,27 @@ class PreopCaseEmbedder:
         batch_size: Optional[int] = None,
         debug_frac: Optional[float] = None,
         case_ids: Optional[List[str]] = None,
+        pca_fit_batches: int = 10,
     ) -> pd.DataFrame:
         """
-        Process all cases and save to parquet.
+        Process all cases and save to parquet (single-pass, memory efficient).
+
+        Uses incremental PCA fitting on first N batches, then streams remaining
+        batches directly to parquet without re-embedding.
 
         Args:
             output_path: Path for output parquet file
             batch_size: Number of cases per batch (default: config value)
             debug_frac: If set, only process this fraction of cases
             case_ids: If set, only process these specific case IDs
+            pca_fit_batches: Number of batches to fit PCA on (default: 10 = 100k cases)
 
         Returns:
             DataFrame with case IDs and embeddings
         """
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
         batch_size = batch_size or self.config.batch_size
 
         # Get case IDs to process
@@ -732,139 +551,388 @@ class PreopCaseEmbedder:
 
         n_cases = len(all_case_ids)
         total_batches = (n_cases + batch_size - 1) // batch_size
-        logger.info(f"Processing {n_cases:,} cases in batches of {batch_size:,}")
+        logger.info(f"Processing {n_cases:,} cases in {total_batches} batches of {batch_size:,}")
 
         t_start = time.time()
-
-        # =================================================================
-        # PASS 1: Fit IncrementalPCA on all batches
-        # =================================================================
-        logger.info("=" * 60)
-        logger.info("PASS 1: Fitting dimension reducers on all data...")
-        logger.info("=" * 60)
-
-        for batch_idx, i in enumerate(range(0, n_cases, batch_size)):
-            batch_ids = all_case_ids[i : i + batch_size]
-            batch_num = batch_idx + 1
-
-            logger.info(f"Fit batch {batch_num}/{total_batches}: cases {i:,} to {i+len(batch_ids):,}")
-
-            # Call embed methods - they will partial_fit
-            _ = self.embed_medications(batch_ids)
-            _ = self.embed_structured(batch_ids)
-
-            # Log progress
-            elapsed = time.time() - t_start
-            cases_done = i + len(batch_ids)
-            rate = cases_done / elapsed if elapsed > 0 else 0
-
-            logger.info(
-                f"  Fit progress: {cases_done:,}/{n_cases:,} cases "
-                f"({cases_done/n_cases*100:.1f}%) - {rate:.0f} cases/s"
-            )
-
-            gc.collect()
-
-        # Mark as fitted - next calls will transform
-        self._medication_pca_fitted = True
-        self._structured_svd_fitted = True
-        logger.info("Dimension reducers fitted on all data!")
-
-        # =================================================================
-        # PASS 2: Transform all batches and collect results
-        # =================================================================
-        logger.info("=" * 60)
-        logger.info("PASS 2: Generating embeddings...")
-        logger.info("=" * 60)
-
-        results = []
-        t_pass2 = time.time()
-
-        for batch_idx, i in enumerate(range(0, n_cases, batch_size)):
-            batch_ids = all_case_ids[i : i + batch_size]
-            batch_num = batch_idx + 1
-
-            logger.info(f"Transform batch {batch_num}/{total_batches}: cases {i:,} to {i+len(batch_ids):,}")
-
-            # Get embeddings and procedure text
-            X_proc, texts = self.embed_procedures(batch_ids, return_texts=True)
-            X_med = self.embed_medications(batch_ids)
-            X_struct = self.embed_structured(batch_ids)
-
-            # Concatenate and normalize
-            X_full = np.concatenate([X_proc, X_med, X_struct], axis=1)
-            X_full = normalize(X_full, norm="l2").astype(np.float32)
-
-            # Build batch DataFrame
-            batch_df = pd.DataFrame(
-                {
-                    "mpog_case_id": batch_ids,
-                    "procedure_text": texts,
-                    "embedding": list(X_full),
-                    "proc_emb": list(X_proc),
-                    "med_emb": list(X_med),
-                    "struct_emb": list(X_struct),
-                }
-            )
-
-            results.append(batch_df)
-
-            # Log progress
-            elapsed = time.time() - t_pass2
-            cases_done = i + len(batch_ids)
-            rate = cases_done / elapsed if elapsed > 0 else 0
-            eta = (n_cases - cases_done) / rate if rate > 0 else 0
-
-            logger.info(
-                f"  Progress: {cases_done:,}/{n_cases:,} cases "
-                f"({cases_done/n_cases*100:.1f}%) - "
-                f"{rate:.0f} cases/s - ETA: {eta/60:.1f}min"
-            )
-
-            # Cleanup
-            del X_proc, X_med, X_struct, X_full
-            gc.collect()
-
-        # Combine all batches
-        logger.info("Combining batches...")
-        df = pd.concat(results, ignore_index=True)
-
-        # Save to parquet
-        logger.info(f"Saving to {output_path}...")
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-        df.to_parquet(output_path, index=False)
+
+        # =================================================================
+        # SINGLE PASS: Fit PCA on first N batches, then transform all
+        # =================================================================
+        # We cache raw embeddings during PCA fitting phase to avoid re-embedding
+        logger.info("=" * 60)
+        logger.info(f"SINGLE PASS: Fit PCA on first {pca_fit_batches} batches, stream rest")
+        logger.info("=" * 60)
+
+        # Storage for PCA fitting phase
+        fit_phase_med_embeddings = []  # Cache 384-dim embeddings during fit
+        fit_phase_struct_raw = []  # Cache raw structured features during fit
+        fit_phase_case_ids = []  # Track case IDs for fit phase
+
+        pq_writer = None
+        total_written = 0
+
+        try:
+            for batch_idx, i in enumerate(range(0, n_cases, batch_size)):
+                batch_ids = all_case_ids[i : i + batch_size]
+                batch_num = batch_idx + 1
+
+                logger.info(f"Batch {batch_num}/{total_batches}: cases {i:,} to {i+len(batch_ids):,}")
+
+                # Get procedure embeddings and text
+                X_proc, texts = self.embed_procedures(batch_ids, return_texts=True)
+
+                # PCA FITTING PHASE: Cache raw embeddings, partial_fit
+                if batch_num <= pca_fit_batches:
+                    logger.info(f"  [PCA Fitting] Batch {batch_num}/{pca_fit_batches}")
+
+                    # Get raw medication embeddings (384-dim, no PCA yet)
+                    X_med_raw = self._embed_medications_raw(batch_ids)
+                    fit_phase_med_embeddings.append(X_med_raw)
+                    fit_phase_case_ids.extend(batch_ids)
+
+                    # Partial fit medication PCA
+                    if self._medication_pca is None:
+                        n_components = min(self.config.medication_dim, X_med_raw.shape[1])
+                        self._medication_pca = IncrementalPCA(n_components=n_components)
+                    self._medication_pca.partial_fit(X_med_raw)
+
+                    # Get raw structured features and partial fit
+                    X_struct_raw = self._get_structured_raw(batch_ids)
+                    fit_phase_struct_raw.append(X_struct_raw)
+
+                    if self._structured_svd is not None:
+                        self._structured_svd.partial_fit(X_struct_raw)
+
+                    # If this is the last fit batch, finalize PCA and process cached data
+                    if batch_num == pca_fit_batches or batch_num == total_batches:
+                        logger.info("  Finalizing PCA fitting...")
+                        self._medication_pca_fitted = True
+                        self._structured_svd_fitted = True
+
+                        # Process all cached fit-phase data
+                        logger.info(f"  Processing {len(fit_phase_case_ids):,} cached cases from fit phase...")
+
+                        # Stack cached embeddings
+                        all_med_raw = np.vstack(fit_phase_med_embeddings)
+                        all_struct_raw = np.vstack(fit_phase_struct_raw)
+
+                        # Transform with fitted PCA
+                        X_med_all = self._medication_pca.transform(all_med_raw)
+                        X_med_all = normalize(X_med_all, norm="l2").astype(np.float32)
+
+                        if self._structured_svd is not None:
+                            X_struct_all = self._structured_svd.transform(all_struct_raw)
+                        else:
+                            X_struct_all = all_struct_raw
+                        X_struct_all = self._pad_to_dim(X_struct_all, self.config.structured_dim)
+                        X_struct_all = normalize(X_struct_all, norm="l2").astype(np.float32)
+
+                        # Re-embed procedures for fit phase cases (we already have them for current batch)
+                        # Process in sub-batches to avoid re-loading all
+                        offset = 0
+                        for fit_batch_idx in range(batch_num):
+                            fit_start = fit_batch_idx * batch_size
+                            fit_end = min(fit_start + batch_size, len(fit_phase_case_ids))
+                            fit_batch_ids = fit_phase_case_ids[fit_start:fit_end]
+                            fit_batch_len = len(fit_batch_ids)
+
+                            # Get corresponding slices
+                            X_med_batch = X_med_all[offset:offset + fit_batch_len]
+                            X_struct_batch = X_struct_all[offset:offset + fit_batch_len]
+
+                            # Re-embed procedures for this sub-batch
+                            X_proc_batch, texts_batch = self.embed_procedures(fit_batch_ids, return_texts=True)
+
+                            # Concatenate and normalize
+                            X_full = np.concatenate([X_proc_batch, X_med_batch, X_struct_batch], axis=1)
+                            X_full = normalize(X_full, norm="l2").astype(np.float32)
+
+                            # Write batch
+                            pq_writer = self._write_batch_to_parquet(
+                                pq_writer, output_path,
+                                fit_batch_ids, texts_batch, X_full, X_proc_batch, X_med_batch, X_struct_batch
+                            )
+                            total_written += fit_batch_len
+                            offset += fit_batch_len
+
+                        # Clear caches
+                        del fit_phase_med_embeddings, fit_phase_struct_raw, all_med_raw, all_struct_raw
+                        del X_med_all, X_struct_all
+                        fit_phase_med_embeddings = []
+                        fit_phase_struct_raw = []
+                        fit_phase_case_ids = []
+                        gc.collect()
+
+                # TRANSFORM PHASE: PCA is fitted, process directly
+                else:
+                    # Embed and transform medications
+                    X_med = self.embed_medications(batch_ids)
+                    X_struct = self.embed_structured(batch_ids)
+
+                    # Concatenate and normalize
+                    X_full = np.concatenate([X_proc, X_med, X_struct], axis=1)
+                    X_full = normalize(X_full, norm="l2").astype(np.float32)
+
+                    # Write batch
+                    pq_writer = self._write_batch_to_parquet(
+                        pq_writer, output_path,
+                        batch_ids, texts, X_full, X_proc, X_med, X_struct
+                    )
+                    total_written += len(batch_ids)
+
+                    del X_med, X_struct, X_full
+                    gc.collect()
+
+                # Log progress
+                elapsed = time.time() - t_start
+                rate = total_written / elapsed if elapsed > 0 else 0
+                remaining = n_cases - total_written
+                eta = remaining / rate if rate > 0 else 0
+
+                logger.info(
+                    f"  Written: {total_written:,}/{n_cases:,} cases "
+                    f"({total_written/n_cases*100:.1f}%) - "
+                    f"{rate:.0f} cases/s - ETA: {eta/60:.1f}min"
+                )
+
+        finally:
+            if pq_writer is not None:
+                pq_writer.close()
 
         total_time = time.time() - t_start
+        logger.info("=" * 60)
         logger.info(
             f"Complete! Processed {n_cases:,} cases in {total_time/60:.1f} minutes"
         )
         logger.info(f"Output: {output_path}")
+        logger.info(f"Rate: {n_cases/total_time:.0f} cases/second")
+        logger.info("=" * 60)
 
         # Unload model to free memory
         if self._text_embedder is not None:
             self._text_embedder.unload()
             self._text_embedder = None
 
-        return df
+        # Return the saved dataframe
+        return pd.read_parquet(output_path)
 
-    def fit_reducers(self, sample_size: int = 50000) -> None:
+    def _embed_medications_raw(self, case_ids: List[str]) -> np.ndarray:
+        """
+        Embed medication profiles without PCA reduction.
+
+        Returns raw 384-dim embeddings for PCA fitting.
+        """
+        logger.info(f"Embedding medications (raw) for {len(case_ids):,} cases")
+
+        con = connect_db(self.meds_db)
+        try:
+            table = self._get_meds_table(con)
+            cols = get_columns(con, table)
+
+            # Find text column
+            text_col = next((c for c in cols if "text" in c.lower()), None)
+            if text_col is None:
+                logger.warning("No medication text column found, using zeros")
+                embedder = self._get_text_embedder()
+                return np.zeros((len(case_ids), embedder.dim), dtype=np.float32)
+
+            # Aggregate medication text per case
+            df = con.execute(
+                f"""
+                SELECT "{self.config.id_col}",
+                       STRING_AGG("{text_col}", ', ') AS med_text
+                FROM {table}
+                WHERE "{self.config.id_col}" IN (SELECT * FROM UNNEST(?))
+                GROUP BY "{self.config.id_col}"
+                """,
+                [case_ids],
+            ).fetchdf()
+        finally:
+            con.close()
+
+        # Create mapping of case_id -> med_text
+        df[self.config.id_col] = df[self.config.id_col].astype(str)
+        med_dict = dict(zip(df[self.config.id_col], df["med_text"]))
+
+        # Get medication text for each case (in order)
+        med_texts = []
+        for cid in case_ids:
+            text = med_dict.get(cid, "")
+            text = clean_text(text, max_chars=1024)
+            if not text:
+                text = "no medications"
+            med_texts.append(text)
+
+        # Embed medication texts (no PCA reduction)
+        embedder = self._get_text_embedder()
+        X_raw = embedder.encode(med_texts, batch_size=self.config.embed_batch_size)
+
+        return X_raw
+
+    def _get_structured_raw(self, case_ids: List[str]) -> np.ndarray:
+        """
+        Get raw structured features (after scaling/one-hot, before SVD).
+
+        Used during PCA fitting phase.
+        """
+        logger.info(f"Getting structured features (raw) for {len(case_ids):,} cases")
+
+        con = connect_db(self.caseinfo_db)
+        try:
+            table = self._get_caseinfo_table(con)
+            existing_cols = set(get_columns(con, table))
+
+            # Collect columns to fetch
+            all_cols = [self.config.id_col]
+            num_cols = [c for c in self.config.numerical_cols if c in existing_cols]
+            cat_cols = [c for c in self.config.categorical_cols if c in existing_cols]
+            bin_cols = [c for c in self.config.comorbidity_cols if c in existing_cols]
+
+            all_cols.extend(num_cols + cat_cols + bin_cols)
+
+            # Fetch data
+            col_sql = ", ".join([f'"{c}"' for c in all_cols])
+            df = con.execute(
+                f"SELECT {col_sql} FROM {table} "
+                f'WHERE "{self.config.id_col}" IN (SELECT * FROM UNNEST(?))',
+                [case_ids],
+            ).fetchdf()
+        finally:
+            con.close()
+
+        # Reorder to match input case_ids
+        df[self.config.id_col] = df[self.config.id_col].astype(str)
+        df = df.set_index(self.config.id_col).loc[case_ids].reset_index()
+
+        # Handle missing values
+        missing_cols = []
+
+        for col in num_cols:
+            if col in df.columns:
+                miss_col = f"{col}_missing"
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+                df[miss_col] = df[col].isna().astype(float)
+                df[col] = df[col].fillna(0).astype(float)
+                missing_cols.append(miss_col)
+
+        for col in cat_cols:
+            if col in df.columns:
+                df[col] = df[col].fillna("Unknown").astype(str)
+
+        for col in bin_cols:
+            if col in df.columns:
+                miss_col = f"{col}_missing"
+                df[miss_col] = df[col].isna().astype(float)
+                df[col] = df[col].astype(str).str.lower()
+                df[col] = df[col].replace({
+                    "yes": "1", "true": "1",
+                    "no": "0", "false": "0",
+                    "nan": "0", "none": "0", "<na>": "0", "": "0"
+                })
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(float)
+                missing_cols.append(miss_col)
+
+        # Build preprocessing pipeline if needed
+        if self._structured_pipeline is None:
+            transformers = []
+
+            if num_cols:
+                transformers.append(("num", StandardScaler(), num_cols))
+            if cat_cols:
+                transformers.append(("cat", OneHotEncoder(handle_unknown="ignore", sparse_output=False), cat_cols))
+            if bin_cols:
+                transformers.append(("bin", "passthrough", bin_cols))
+            if missing_cols:
+                transformers.append(("missing", "passthrough", missing_cols))
+
+            if not transformers:
+                return np.zeros((len(case_ids), self.config.structured_dim), dtype=np.float32)
+
+            self._structured_pipeline = ColumnTransformer(transformers, remainder="drop")
+            X_raw = self._structured_pipeline.fit_transform(df)
+
+            # Initialize SVD
+            n_components = min(self.config.structured_dim, X_raw.shape[1])
+            if n_components > 1:
+                self._structured_svd = IncrementalPCA(n_components=n_components)
+
+            return X_raw.astype(np.float32)
+
+        return self._structured_pipeline.transform(df).astype(np.float32)
+
+    def _pad_to_dim(self, X: np.ndarray, target_dim: int) -> np.ndarray:
+        """Pad array to target dimension if needed."""
+        if X.shape[1] < target_dim:
+            padding = np.zeros((X.shape[0], target_dim - X.shape[1]), dtype=np.float32)
+            return np.hstack([X, padding])
+        return X
+
+    def _write_batch_to_parquet(
+        self,
+        writer,
+        output_path: str,
+        case_ids: List[str],
+        texts: List[str],
+        X_full: np.ndarray,
+        X_proc: np.ndarray,
+        X_med: np.ndarray,
+        X_struct: np.ndarray,
+    ):
+        """Write a batch to parquet file (append mode)."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        batch_df = pd.DataFrame({
+            "mpog_case_id": case_ids,
+            "procedure_text": texts,
+            "embedding": list(X_full),
+            "proc_emb": list(X_proc),
+            "med_emb": list(X_med),
+            "struct_emb": list(X_struct),
+        })
+
+        table = pa.Table.from_pandas(batch_df)
+
+        if writer is None:
+            writer = pq.ParquetWriter(output_path, table.schema)
+
+        writer.write_table(table)
+        return writer
+
+    def fit_reducers(self, sample_size: int = 50000, batch_size: int = 10000) -> None:
         """
         Pre-fit IncrementalPCA reducers on a sample of data.
 
-        Note: process_all() automatically fits on ALL data using two passes.
-        This method is only needed if you want to fit on a subset first.
+        Note: process_all() automatically fits during processing.
+        This method is only needed if you want to fit separately.
 
         Args:
             sample_size: Number of cases to use for fitting
+            batch_size: Batch size for fitting
         """
-        logger.info(f"Fitting reducers on {sample_size:,} case sample")
+        logger.info(f"Fitting reducers on {sample_size:,} cases in batches of {batch_size}")
 
         # Get sample case IDs
         case_ids = self.get_case_ids(limit=sample_size)
 
-        # Partial fit by running embed methods
-        _ = self.embed_medications(case_ids)
-        _ = self.embed_structured(case_ids)
+        # Process in batches for IncrementalPCA
+        for i in range(0, len(case_ids), batch_size):
+            batch_ids = case_ids[i:i + batch_size]
+            logger.info(f"  Fitting batch {i//batch_size + 1}: cases {i} to {i + len(batch_ids)}")
+
+            # Get raw embeddings and partial_fit
+            X_med_raw = self._embed_medications_raw(batch_ids)
+            if self._medication_pca is None:
+                n_components = min(self.config.medication_dim, X_med_raw.shape[1])
+                self._medication_pca = IncrementalPCA(n_components=n_components)
+            self._medication_pca.partial_fit(X_med_raw)
+
+            X_struct_raw = self._get_structured_raw(batch_ids)
+            if self._structured_svd is not None:
+                self._structured_svd.partial_fit(X_struct_raw)
+
+            gc.collect()
 
         # Mark as fitted so transforms work
         self._medication_pca_fitted = True
