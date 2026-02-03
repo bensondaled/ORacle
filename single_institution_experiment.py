@@ -112,12 +112,21 @@ def evaluate_per_institution(
     """
     Evaluate model on each institution separately.
 
-    Returns dict: {institution_id: {loss, mse, mae, n_samples}}
+    Returns dict: {institution_id: {
+        overall: {mse, mae, rmse, n_samples},
+        per_target: {target_name: {mse, mae, rmse}},
+        per_timepoint: {t: {mse, mae, rmse}},
+        per_target_timepoint: {target_name: {t: {mse, mae, rmse}}}
+    }}
     """
     from intraop_dataset import StreamingIntraOpDataset
 
     model.eval()
     results = {}
+
+    target_cols = config.get('target_cols', ['phys_bp_mean_non_invasive'])
+    n_targets = len(target_cols)
+    n_timepoints = config.get('future_steps', 15)
 
     for file_path in file_paths:
         # Extract institution ID from filename
@@ -147,10 +156,12 @@ def evaluate_per_institution(
             collate_fn=StreamingIntraOpDataset.collate_fn,
         )
 
-        # Evaluate
-        total_loss = 0.0
-        total_mse = 0.0
-        total_mae = 0.0
+        # Accumulators for detailed metrics
+        # Shape: [n_timepoints, n_targets]
+        sum_sq_error = np.zeros((n_timepoints, n_targets))
+        sum_abs_error = np.zeros((n_timepoints, n_targets))
+        count = np.zeros((n_timepoints, n_targets))
+
         n_samples = 0
 
         with torch.no_grad():
@@ -173,33 +184,118 @@ def evaluate_per_institution(
                     static_num=batch.get("static_num"),
                 )
 
-                # Compute metrics
+                # preds shape: [batch, n_timepoints, n_targets] or [batch, n_timepoints]
+                # targets shape: [batch, n_timepoints, n_targets]
                 targets = batch["target"].float()
-                mask = targets != 0  # Simple mask for non-zero targets
 
-                if mask.any():
-                    mse = ((preds - targets) ** 2)[mask].mean()
-                    mae = (preds - targets).abs()[mask].mean()
-                    loss = mse  # Use MSE as loss
+                # Handle shape
+                if preds.dim() == 2:
+                    preds = preds.unsqueeze(-1)  # [batch, time, 1]
+                if targets.dim() == 2:
+                    targets = targets.unsqueeze(-1)
 
-                    batch_size = targets.size(0)
-                    total_loss += loss.item() * batch_size
-                    total_mse += mse.item() * batch_size
-                    total_mae += mae.item() * batch_size
-                    n_samples += batch_size
+                # Move to CPU for accumulation
+                preds_np = preds.cpu().numpy()
+                targets_np = targets.cpu().numpy()
+
+                # Compute per timepoint, per target
+                for t in range(min(n_timepoints, preds_np.shape[1])):
+                    for tgt in range(min(n_targets, preds_np.shape[2])):
+                        pred_t = preds_np[:, t, tgt]
+                        targ_t = targets_np[:, t, tgt]
+
+                        # Mask non-zero targets
+                        mask = targ_t != 0
+                        if mask.any():
+                            sq_err = (pred_t[mask] - targ_t[mask]) ** 2
+                            abs_err = np.abs(pred_t[mask] - targ_t[mask])
+
+                            sum_sq_error[t, tgt] += sq_err.sum()
+                            sum_abs_error[t, tgt] += abs_err.sum()
+                            count[t, tgt] += mask.sum()
+
+                n_samples += targets.size(0)
 
         # Compute averages
         if n_samples > 0:
+            # Avoid division by zero
+            count_safe = np.maximum(count, 1)
+
+            mse_matrix = sum_sq_error / count_safe
+            mae_matrix = sum_abs_error / count_safe
+            rmse_matrix = np.sqrt(mse_matrix)
+
+            # Overall metrics (weighted average across all)
+            total_sq_err = sum_sq_error.sum()
+            total_abs_err = sum_abs_error.sum()
+            total_count = count.sum()
+
+            overall_mse = total_sq_err / total_count if total_count > 0 else 0
+            overall_mae = total_abs_err / total_count if total_count > 0 else 0
+            overall_rmse = np.sqrt(overall_mse)
+
+            # Per-target metrics (average across timepoints)
+            per_target = {}
+            for tgt_idx, tgt_name in enumerate(target_cols[:n_targets]):
+                tgt_count = count[:, tgt_idx].sum()
+                if tgt_count > 0:
+                    per_target[tgt_name] = {
+                        "mse": float(sum_sq_error[:, tgt_idx].sum() / tgt_count),
+                        "mae": float(sum_abs_error[:, tgt_idx].sum() / tgt_count),
+                        "rmse": float(np.sqrt(sum_sq_error[:, tgt_idx].sum() / tgt_count)),
+                    }
+
+            # Per-timepoint metrics (average across targets)
+            per_timepoint = {}
+            for t in range(n_timepoints):
+                t_count = count[t, :].sum()
+                if t_count > 0:
+                    per_timepoint[t + 1] = {  # 1-indexed for readability
+                        "mse": float(sum_sq_error[t, :].sum() / t_count),
+                        "mae": float(sum_abs_error[t, :].sum() / t_count),
+                        "rmse": float(np.sqrt(sum_sq_error[t, :].sum() / t_count)),
+                    }
+
+            # Per-target-timepoint (full matrix)
+            per_target_timepoint = {}
+            for tgt_idx, tgt_name in enumerate(target_cols[:n_targets]):
+                per_target_timepoint[tgt_name] = {}
+                for t in range(n_timepoints):
+                    if count[t, tgt_idx] > 0:
+                        per_target_timepoint[tgt_name][t + 1] = {
+                            "mse": float(mse_matrix[t, tgt_idx]),
+                            "mae": float(mae_matrix[t, tgt_idx]),
+                            "rmse": float(rmse_matrix[t, tgt_idx]),
+                        }
+
             results[inst_id] = {
-                "loss": total_loss / n_samples,
-                "mse": total_mse / n_samples,
-                "mae": total_mae / n_samples,
-                "rmse": np.sqrt(total_mse / n_samples),
-                "n_samples": n_samples,
+                "overall": {
+                    "mse": float(overall_mse),
+                    "mae": float(overall_mae),
+                    "rmse": float(overall_rmse),
+                    "n_samples": int(n_samples),
+                },
+                "per_target": per_target,
+                "per_timepoint": per_timepoint,
+                "per_target_timepoint": per_target_timepoint,
             }
-            print(f"    MSE: {results[inst_id]['mse']:.4f}, MAE: {results[inst_id]['mae']:.4f}, RMSE: {results[inst_id]['rmse']:.4f}, N: {n_samples:,}")
+
+            print(f"    Overall - MSE: {overall_mse:.4f}, MAE: {overall_mae:.4f}, RMSE: {overall_rmse:.4f}, N: {n_samples:,}")
+
+            # Print per-target summary
+            print(f"    Per-target MSE: ", end="")
+            for tgt_name, m in per_target.items():
+                short_name = tgt_name.split("_")[-1][:8]
+                print(f"{short_name}={m['mse']:.3f} ", end="")
+            print()
+
         else:
-            results[inst_id] = {"loss": 0, "mse": 0, "mae": 0, "rmse": 0, "n_samples": 0}
+            results[inst_id] = {
+                "overall": {"mse": 0, "mae": 0, "rmse": 0, "n_samples": 0},
+                "per_target": {},
+                "per_timepoint": {},
+                "per_target_timepoint": {},
+            }
             print(f"    No samples!")
 
         # Cleanup
