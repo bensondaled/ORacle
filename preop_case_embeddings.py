@@ -378,19 +378,28 @@ class PreopCaseEmbedder:
         try:
             table = self._get_caseinfo_table(con)
 
-            # Fetch procedure text
+            # Fetch procedure text (one per case, aggregated if multiple)
             df = con.execute(
-                f'SELECT "{self.config.id_col}", "{self.config.procedure_col}" '
+                f'SELECT "{self.config.id_col}", '
+                f'FIRST("{self.config.procedure_col}") AS "{self.config.procedure_col}" '
                 f"FROM {table} "
-                f'WHERE "{self.config.id_col}" IN (SELECT * FROM UNNEST(?))',
+                f'WHERE "{self.config.id_col}" IN (SELECT * FROM UNNEST(?)) '
+                f'GROUP BY "{self.config.id_col}"',
                 [case_ids],
             ).fetchdf()
         finally:
             con.close()
 
-        # Reorder to match input case_ids
+        # Reorder to match input case_ids (use dict for O(1) lookup)
         df[self.config.id_col] = df[self.config.id_col].astype(str)
-        df = df.set_index(self.config.id_col).loc[case_ids].reset_index()
+        proc_dict = dict(zip(df[self.config.id_col], df[self.config.procedure_col]))
+
+        # Build list in order of input case_ids
+        proc_texts = [proc_dict.get(str(cid), "") for cid in case_ids]
+        df = pd.DataFrame({
+            self.config.id_col: case_ids,
+            self.config.procedure_col: proc_texts,
+        })
 
         # Clean text
         texts = [clean_text(t) for t in df[self.config.procedure_col]]
@@ -791,19 +800,36 @@ class PreopCaseEmbedder:
 
             all_cols.extend(num_cols + cat_cols + bin_cols)
 
-            # Fetch data
+            # Fetch data (DISTINCT to handle any duplicate rows)
             col_sql = ", ".join([f'"{c}"' for c in all_cols])
             df = con.execute(
-                f"SELECT {col_sql} FROM {table} "
+                f"SELECT DISTINCT {col_sql} FROM {table} "
                 f'WHERE "{self.config.id_col}" IN (SELECT * FROM UNNEST(?))',
                 [case_ids],
             ).fetchdf()
         finally:
             con.close()
 
-        # Reorder to match input case_ids
+        # Ensure one row per case_id and reorder to match input
         df[self.config.id_col] = df[self.config.id_col].astype(str)
-        df = df.set_index(self.config.id_col).loc[case_ids].reset_index()
+        df = df.drop_duplicates(subset=[self.config.id_col], keep='first')
+
+        # Create lookup dict for each column
+        df_dict = df.set_index(self.config.id_col).to_dict('index')
+
+        # Rebuild DataFrame in order of input case_ids
+        rows = []
+        for cid in case_ids:
+            cid_str = str(cid)
+            if cid_str in df_dict:
+                row = {self.config.id_col: cid_str, **df_dict[cid_str]}
+            else:
+                # Missing case - use defaults
+                row = {self.config.id_col: cid_str}
+                for col in all_cols[1:]:  # Skip id_col
+                    row[col] = None
+            rows.append(row)
+        df = pd.DataFrame(rows)
 
         # Handle missing values
         missing_cols = []
