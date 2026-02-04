@@ -182,6 +182,7 @@ def evaluate_per_institution(
                     attention_mask=batch["attention_mask"].bool(),
                     static_cat=batch.get("static_cat"),
                     static_num=batch.get("static_num"),
+                    future_steps=n_timepoints,
                 )
 
                 # preds shape: [batch, n_timepoints, n_targets] or [batch, n_timepoints]
@@ -527,6 +528,8 @@ def main():
     global_step = 0
 
     # Simple evaluation function
+    future_steps = config.get("future_steps", 15)
+
     def evaluate(model, loader, device):
         model.eval()
         total_loss = 0
@@ -549,6 +552,7 @@ def main():
                     attention_mask=batch["attention_mask"].bool(),
                     static_cat=batch.get("static_cat"),
                     static_num=batch.get("static_num"),
+                    future_steps=future_steps,
                 )
 
                 targets = batch["target"].float()
