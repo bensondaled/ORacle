@@ -79,18 +79,21 @@ def predict_with_row_output(
     output_dir: Path,
     batch_size: int = 256,
     debug_frac: float = None,
+    chunk_size: int = 50000,  # Write in chunks to avoid memory buildup
 ) -> dict:
     """
     Generate predictions for each row and save to parquet.
 
-    Processes one institution at a time (memory efficient).
-    Saves: original columns + pred_t1, pred_t2, ..., pred_t15 for each target.
+    Memory efficient: streams predictions in chunks, writes incrementally.
+    Processes one institution at a time.
 
     Returns dict of {inst_id: output_file_path}
     """
     import gc
     import pandas as pd
-    from torch.utils.data import DataLoader
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from torch.utils.data import DataLoader, Subset
     from intraop_dataset import IntraOpDataset
 
     model.eval()
@@ -99,6 +102,12 @@ def predict_with_row_output(
     target_cols = config.get('target_cols', ['phys_bp_mean_non_invasive'])
     n_targets = len(target_cols)
     n_timepoints = config.get('future_steps', 15)
+
+    # Build prediction column names
+    pred_cols = []
+    for tgt_name in target_cols[:n_targets]:
+        for t in range(n_timepoints):
+            pred_cols.append(f"pred_{tgt_name}_t{t+1}")
 
     results = {}
 
@@ -109,16 +118,16 @@ def predict_with_row_output(
 
         print(f"\n  Processing institution {inst_id}...")
 
-        # Load the full dataframe (we need to add predictions back)
+        # Load dataframe
         df = pd.read_parquet(file_path)
-        original_len = len(df)
 
         if debug_frac:
             df = df.sample(frac=debug_frac, random_state=42).reset_index(drop=True)
 
-        print(f"    Rows: {len(df):,}")
+        n_rows = len(df)
+        print(f"    Rows: {n_rows:,}")
 
-        # Create dataset (non-streaming, we need indices)
+        # Create full dataset
         dataset = IntraOpDataset(
             df=df,
             config=config,
@@ -126,89 +135,94 @@ def predict_with_row_output(
             split="test",
         )
 
-        loader = DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=False,  # Keep order!
-            num_workers=0,
-            pin_memory=True,
-        )
+        n_valid = len(dataset)
+        print(f"    Valid samples: {n_valid:,}")
 
-        # Collect all predictions
-        all_preds = []
+        # Output file
+        output_file = output_dir / f"predictions_{inst_id}.parquet"
+        pq_writer = None
+        rows_written = 0
 
-        with torch.no_grad():
-            for batch in loader:
-                # Move to device
-                for k, v in batch.items():
-                    if torch.is_tensor(v):
-                        batch[k] = v.to(device, non_blocking=True)
-                    elif k == "static_cat" and isinstance(v, dict):
-                        batch[k] = {sk: sv.to(device) for sk, sv in v.items()}
+        try:
+            # Process in chunks
+            for chunk_start in range(0, n_valid, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, n_valid)
+                chunk_indices = list(range(chunk_start, chunk_end))
 
-                # Forward pass
-                preds, _, _ = model(
-                    vitals=batch["vitals"].float(),
-                    meds=batch["meds"].float(),
-                    gases=batch["gases"].float(),
-                    bolus=batch["bolus"].float(),
-                    attention_mask=batch["attention_mask"].bool(),
-                    static_cat=batch.get("static_cat"),
-                    static_num=batch.get("static_num"),
-                    future_steps=n_timepoints,
+                # Create subset dataset for this chunk
+                subset = Subset(dataset, chunk_indices)
+                loader = DataLoader(
+                    subset,
+                    batch_size=batch_size,
+                    shuffle=False,
+                    num_workers=0,
+                    pin_memory=True,
                 )
 
-                # preds shape: [batch, n_timepoints, n_targets] or [batch, n_timepoints]
-                if preds.dim() == 2:
-                    preds = preds.unsqueeze(-1)
+                # Collect predictions for this chunk
+                chunk_preds = []
 
-                all_preds.append(preds.cpu().numpy())
+                with torch.no_grad():
+                    for batch in loader:
+                        for k, v in batch.items():
+                            if torch.is_tensor(v):
+                                batch[k] = v.to(device, non_blocking=True)
+                            elif k == "static_cat" and isinstance(v, dict):
+                                batch[k] = {sk: sv.to(device) for sk, sv in v.items()}
 
-        # Stack all predictions
-        all_preds = np.concatenate(all_preds, axis=0)  # [n_samples, n_timepoints, n_targets]
+                        preds, _, _ = model(
+                            vitals=batch["vitals"].float(),
+                            meds=batch["meds"].float(),
+                            gases=batch["gases"].float(),
+                            bolus=batch["bolus"].float(),
+                            attention_mask=batch["attention_mask"].bool(),
+                            static_cat=batch.get("static_cat"),
+                            static_num=batch.get("static_num"),
+                            future_steps=n_timepoints,
+                        )
 
-        print(f"    Predictions shape: {all_preds.shape}")
+                        if preds.dim() == 2:
+                            preds = preds.unsqueeze(-1)
 
-        # Add prediction columns to dataframe
-        # Only add for rows that were in the dataset (valid cases)
-        n_valid = len(dataset)
+                        chunk_preds.append(preds.cpu().numpy())
 
-        # Get valid case indices from dataset
-        valid_indices = dataset.case_ids if hasattr(dataset, 'case_ids') else list(range(n_valid))
+                # Stack chunk predictions
+                chunk_preds = np.concatenate(chunk_preds, axis=0)
 
-        # Create prediction columns (initialize with NaN)
-        for tgt_idx, tgt_name in enumerate(target_cols[:n_targets]):
-            for t in range(n_timepoints):
-                col_name = f"pred_{tgt_name}_t{t+1}"
-                df[col_name] = np.nan
+                # Get corresponding rows from df
+                chunk_df = df.iloc[chunk_start:chunk_end].copy()
 
-        # Fill in predictions for valid rows
-        # Note: dataset may have filtered some cases, so we use dataset length
-        if n_valid == len(df):
-            # All rows valid - direct assignment
-            for tgt_idx, tgt_name in enumerate(target_cols[:n_targets]):
-                for t in range(n_timepoints):
-                    col_name = f"pred_{tgt_name}_t{t+1}"
-                    df[col_name] = all_preds[:, t, tgt_idx]
-        else:
-            print(f"    Warning: {n_valid} valid samples out of {len(df)} rows")
-            # Would need to track which rows were used - for now just use first n_valid
-            for tgt_idx, tgt_name in enumerate(target_cols[:n_targets]):
-                for t in range(n_timepoints):
-                    col_name = f"pred_{tgt_name}_t{t+1}"
-                    df.loc[:n_valid-1, col_name] = all_preds[:, t, tgt_idx]
+                # Add prediction columns
+                for tgt_idx, tgt_name in enumerate(target_cols[:n_targets]):
+                    for t in range(n_timepoints):
+                        col_name = f"pred_{tgt_name}_t{t+1}"
+                        chunk_df[col_name] = chunk_preds[:, t, tgt_idx]
 
-        # Save to parquet
-        output_file = output_dir / f"predictions_{inst_id}.parquet"
-        df.to_parquet(output_file, index=False)
+                # Write chunk to parquet
+                table = pa.Table.from_pandas(chunk_df, preserve_index=False)
+                if pq_writer is None:
+                    pq_writer = pq.ParquetWriter(output_file, table.schema)
+                pq_writer.write_table(table)
 
-        print(f"    Saved: {output_file}")
+                rows_written += len(chunk_df)
+                print(f"    Written {rows_written:,}/{n_valid:,} rows", end='\r')
+
+                # Cleanup chunk
+                del chunk_preds, chunk_df, table
+                gc.collect()
+
+        finally:
+            if pq_writer is not None:
+                pq_writer.close()
+
+        print(f"    Saved: {output_file} ({rows_written:,} rows)")
         results[inst_id] = str(output_file)
 
-        # Cleanup
-        del df, all_preds, dataset
+        # Cleanup institution
+        del df, dataset
         gc.collect()
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     return results
 
