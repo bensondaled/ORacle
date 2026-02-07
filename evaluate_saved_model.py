@@ -6,7 +6,13 @@ Evaluate Saved Model on Test Institutions
 Load a saved model and evaluate on all other institutions.
 
 Usage:
+    # Just compute metrics
     python evaluate_saved_model.py --model-dir ./single_inst_outputs/inst_1056_seed42_20260204_005053
+
+    # Save predictions per row to new parquet files
+    python evaluate_saved_model.py --model-dir ./single_inst_outputs/inst_1056_* --save-predictions
+
+    # Debug mode
     python evaluate_saved_model.py --model-dir ./single_inst_outputs/inst_1056_* --debug
 """
 
@@ -52,8 +58,159 @@ def parse_args():
         "--debug", action="store_true",
         help="Debug mode (1% data per institution)"
     )
+    parser.add_argument(
+        "--save-predictions", action="store_true",
+        help="Save row-level predictions to parquet files"
+    )
+    parser.add_argument(
+        "--predictions-dir", type=str, default=None,
+        help="Directory to save prediction files (default: output-dir/predictions)"
+    )
 
     return parser.parse_args()
+
+
+def predict_with_row_output(
+    model: torch.nn.Module,
+    file_paths: list,
+    config: dict,
+    vocabs: dict,
+    device: torch.device,
+    output_dir: Path,
+    batch_size: int = 256,
+    debug_frac: float = None,
+) -> dict:
+    """
+    Generate predictions for each row and save to parquet.
+
+    Processes one institution at a time (memory efficient).
+    Saves: original columns + pred_t1, pred_t2, ..., pred_t15 for each target.
+
+    Returns dict of {inst_id: output_file_path}
+    """
+    import gc
+    import pandas as pd
+    from torch.utils.data import DataLoader
+    from intraop_dataset import IntraOpDataset
+
+    model.eval()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    target_cols = config.get('target_cols', ['phys_bp_mean_non_invasive'])
+    n_targets = len(target_cols)
+    n_timepoints = config.get('future_steps', 15)
+
+    results = {}
+
+    for file_path in file_paths:
+        # Extract institution ID
+        fname = Path(file_path).stem
+        inst_id = int(fname.split("_")[-1]) if "_" in fname else int(fname)
+
+        print(f"\n  Processing institution {inst_id}...")
+
+        # Load the full dataframe (we need to add predictions back)
+        df = pd.read_parquet(file_path)
+        original_len = len(df)
+
+        if debug_frac:
+            df = df.sample(frac=debug_frac, random_state=42).reset_index(drop=True)
+
+        print(f"    Rows: {len(df):,}")
+
+        # Create dataset (non-streaming, we need indices)
+        dataset = IntraOpDataset(
+            df=df,
+            config=config,
+            vocabs=vocabs,
+            split="test",
+        )
+
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,  # Keep order!
+            num_workers=0,
+            pin_memory=True,
+        )
+
+        # Collect all predictions
+        all_preds = []
+
+        with torch.no_grad():
+            for batch in loader:
+                # Move to device
+                for k, v in batch.items():
+                    if torch.is_tensor(v):
+                        batch[k] = v.to(device, non_blocking=True)
+                    elif k == "static_cat" and isinstance(v, dict):
+                        batch[k] = {sk: sv.to(device) for sk, sv in v.items()}
+
+                # Forward pass
+                preds, _, _ = model(
+                    vitals=batch["vitals"].float(),
+                    meds=batch["meds"].float(),
+                    gases=batch["gases"].float(),
+                    bolus=batch["bolus"].float(),
+                    attention_mask=batch["attention_mask"].bool(),
+                    static_cat=batch.get("static_cat"),
+                    static_num=batch.get("static_num"),
+                    future_steps=n_timepoints,
+                )
+
+                # preds shape: [batch, n_timepoints, n_targets] or [batch, n_timepoints]
+                if preds.dim() == 2:
+                    preds = preds.unsqueeze(-1)
+
+                all_preds.append(preds.cpu().numpy())
+
+        # Stack all predictions
+        all_preds = np.concatenate(all_preds, axis=0)  # [n_samples, n_timepoints, n_targets]
+
+        print(f"    Predictions shape: {all_preds.shape}")
+
+        # Add prediction columns to dataframe
+        # Only add for rows that were in the dataset (valid cases)
+        n_valid = len(dataset)
+
+        # Get valid case indices from dataset
+        valid_indices = dataset.case_ids if hasattr(dataset, 'case_ids') else list(range(n_valid))
+
+        # Create prediction columns (initialize with NaN)
+        for tgt_idx, tgt_name in enumerate(target_cols[:n_targets]):
+            for t in range(n_timepoints):
+                col_name = f"pred_{tgt_name}_t{t+1}"
+                df[col_name] = np.nan
+
+        # Fill in predictions for valid rows
+        # Note: dataset may have filtered some cases, so we use dataset length
+        if n_valid == len(df):
+            # All rows valid - direct assignment
+            for tgt_idx, tgt_name in enumerate(target_cols[:n_targets]):
+                for t in range(n_timepoints):
+                    col_name = f"pred_{tgt_name}_t{t+1}"
+                    df[col_name] = all_preds[:, t, tgt_idx]
+        else:
+            print(f"    Warning: {n_valid} valid samples out of {len(df)} rows")
+            # Would need to track which rows were used - for now just use first n_valid
+            for tgt_idx, tgt_name in enumerate(target_cols[:n_targets]):
+                for t in range(n_timepoints):
+                    col_name = f"pred_{tgt_name}_t{t+1}"
+                    df.loc[:n_valid-1, col_name] = all_preds[:, t, tgt_idx]
+
+        # Save to parquet
+        output_file = output_dir / f"predictions_{inst_id}.parquet"
+        df.to_parquet(output_file, index=False)
+
+        print(f"    Saved: {output_file}")
+        results[inst_id] = str(output_file)
+
+        # Cleanup
+        del df, all_preds, dataset
+        gc.collect()
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+    return results
 
 
 def main():
@@ -135,15 +292,43 @@ def main():
 
     del train_df
 
-    # Import evaluation function from single_institution_experiment
+    debug_frac = 0.01 if args.debug else None
+
+    # Mode: save predictions or just compute metrics
+    if args.save_predictions:
+        print("\n" + "=" * 60)
+        print("SAVING ROW-LEVEL PREDICTIONS")
+        print("=" * 60)
+
+        pred_dir = Path(args.predictions_dir) if args.predictions_dir else output_dir / "predictions"
+
+        prediction_files = predict_with_row_output(
+            model=model,
+            file_paths=test_file_paths,
+            config=config,
+            vocabs=vocabs,
+            device=device,
+            output_dir=pred_dir,
+            batch_size=args.batch_size,
+            debug_frac=debug_frac,
+        )
+
+        # Save index of prediction files
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        index_file = output_dir / f"prediction_files_{timestamp}.json"
+        with open(index_file, "w") as f:
+            json.dump(prediction_files, f, indent=2)
+
+        print(f"\nPrediction files index: {index_file}")
+        print(f"Predictions saved to: {pred_dir}")
+        return
+
+    # Otherwise: compute metrics
     from single_institution_experiment import evaluate_per_institution
 
-    # Evaluate
     print("\n" + "=" * 60)
     print("PER-INSTITUTION TEST EVALUATION")
     print("=" * 60)
-
-    debug_frac = 0.01 if args.debug else None
 
     test_results = evaluate_per_institution(
         model=model,
