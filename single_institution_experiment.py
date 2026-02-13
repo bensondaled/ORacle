@@ -136,6 +136,7 @@ def evaluate_per_institution(
         print(f"\n  Evaluating institution {inst_id}...")
 
         # Create dataset for this institution
+        print(f"    Creating dataset...", flush=True)
         dataset = StreamingIntraOpDataset(
             file_paths=[file_path],
             config=config,
@@ -146,6 +147,7 @@ def evaluate_per_institution(
             debug_frac=debug_frac,
             seed=42,
         )
+        print(f"    Dataset created, starting inference...", flush=True)
 
         loader = DataLoader(
             dataset,
@@ -163,9 +165,14 @@ def evaluate_per_institution(
         count = np.zeros((n_timepoints, n_targets))
 
         n_samples = 0
+        n_batches = 0
 
         with torch.no_grad():
             for batch in loader:
+                n_batches += 1
+                if n_batches % 100 == 0:
+                    print(f"    Batch {n_batches}, samples so far: {n_samples:,}", flush=True)
+
                 # Move to device
                 for k, v in batch.items():
                     if torch.is_tensor(v):
