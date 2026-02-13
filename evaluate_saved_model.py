@@ -85,9 +85,9 @@ def predict_with_row_output(
     vocabs: dict,
     device: torch.device,
     output_dir: Path,
-    batch_size: int = 256,
+    batch_size: int = 512,
     debug_frac: float = None,
-    chunk_size: int = 50000,  # Write in chunks to avoid memory buildup
+    chunk_size: int = 200000,  # Write in chunks (larger = faster, more memory)
     wandb_run=None,
 ) -> dict:
     """
@@ -164,8 +164,9 @@ def predict_with_row_output(
                     subset,
                     batch_size=batch_size,
                     shuffle=False,
-                    num_workers=0,
+                    num_workers=4,
                     pin_memory=True,
+                    persistent_workers=True,
                 )
 
                 # Collect predictions for this chunk
