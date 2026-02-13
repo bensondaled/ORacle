@@ -40,6 +40,10 @@ BATCH_SIZE="${BATCH_SIZE:-256}"
 SAVE_PREDS="${SAVE_PREDS:-0}"
 PREDICTIONS_DIR="${PREDICTIONS_DIR:-}"
 
+# WandB
+WANDB_PROJECT="${WANDB_PROJECT:-oracle-eval}"
+NO_WANDB="${NO_WANDB:-0}"
+
 # -----------------------------
 # Environment
 # -----------------------------
@@ -134,6 +138,12 @@ fi
 
 if [ -n "${PREDICTIONS_DIR}" ]; then
     CMD="${CMD} --predictions-dir \"${PREDICTIONS_DIR}\""
+fi
+
+CMD="${CMD} --wandb-project ${WANDB_PROJECT}"
+
+if [ "${NO_WANDB}" = "1" ]; then
+    CMD="${CMD} --no-wandb"
 fi
 
 # Run

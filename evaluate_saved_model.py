@@ -66,6 +66,14 @@ def parse_args():
         "--predictions-dir", type=str, default=None,
         help="Directory to save prediction files (default: output-dir/predictions)"
     )
+    parser.add_argument(
+        "--wandb-project", type=str, default="oracle-eval",
+        help="WandB project name"
+    )
+    parser.add_argument(
+        "--no-wandb", action="store_true",
+        help="Disable WandB logging"
+    )
 
     return parser.parse_args()
 
@@ -80,6 +88,7 @@ def predict_with_row_output(
     batch_size: int = 256,
     debug_frac: float = None,
     chunk_size: int = 50000,  # Write in chunks to avoid memory buildup
+    wandb_run=None,
 ) -> dict:
     """
     Generate predictions for each row and save to parquet.
@@ -218,6 +227,14 @@ def predict_with_row_output(
         print(f"    Saved: {output_file} ({rows_written:,} rows)")
         results[inst_id] = str(output_file)
 
+        # Log to WandB
+        if wandb_run is not None:
+            import wandb
+            wandb.log({
+                f"inst_{inst_id}/rows_written": rows_written,
+                "institutions_completed": len(results),
+            })
+
         # Cleanup institution
         del df, dataset
         gc.collect()
@@ -279,6 +296,28 @@ def main():
     print(f"Loaded model from epoch {checkpoint.get('epoch', '?')}")
     print(f"Validation loss: {checkpoint.get('val_loss', '?'):.4f}")
 
+    # Initialize WandB
+    wandb_run = None
+    if not args.no_wandb:
+        try:
+            import wandb
+            wandb_run = wandb.init(
+                project=args.wandb_project,
+                name=f"eval_inst{training_institution}",
+                config={
+                    "training_institution": training_institution,
+                    "model_epoch": checkpoint.get("epoch"),
+                    "val_loss": checkpoint.get("val_loss"),
+                    "save_predictions": args.save_predictions,
+                    "debug": args.debug,
+                    **config,
+                },
+            )
+            print(f"WandB run: {wandb_run.url}")
+        except Exception as e:
+            print(f"WandB init failed: {e}")
+            wandb_run = None
+
     # Get test institution files (all except training)
     all_institutions = set(INSTITUTION_METADATA.keys()) - {training_institution}
     test_file_paths = []
@@ -339,6 +378,7 @@ def main():
             output_dir=pred_dir,
             batch_size=args.batch_size,
             debug_frac=debug_frac,
+            wandb_run=wandb_run,
         )
 
         # Save index of prediction files
@@ -349,6 +389,12 @@ def main():
 
         print(f"\nPrediction files index: {index_file}")
         print(f"Predictions saved to: {pred_dir}")
+
+        # Finish WandB
+        if wandb_run is not None:
+            import wandb
+            wandb.log({"total_institutions": len(prediction_files)})
+            wandb.finish()
         return
 
     # Otherwise: compute metrics
