@@ -19,6 +19,7 @@ Usage:
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 from datetime import datetime
 
@@ -126,6 +127,7 @@ def predict_with_row_output(
         inst_id = int(fname.split("_")[-1]) if "_" in fname else int(fname)
 
         print(f"\n  Processing institution {inst_id}...")
+        inst_start = time.time()
 
         # Load dataframe
         df = pd.read_feather(file_path)
@@ -225,15 +227,20 @@ def predict_with_row_output(
             if pq_writer is not None:
                 pq_writer.close()
 
-        print(f"    Saved: {output_file} ({rows_written:,} rows)")
+        elapsed = time.time() - inst_start
+        throughput = rows_written / elapsed if elapsed > 0 else 0
+        print(f"    Saved: {output_file} ({rows_written:,} rows in {elapsed/60:.1f}min, {throughput:.0f} rows/s)")
         results[inst_id] = str(output_file)
 
         # Log to WandB
         if wandb_run is not None:
             import wandb
             wandb.log({
-                f"inst_{inst_id}/rows_written": rows_written,
+                f"inst_{inst_id}/rows": rows_written,
+                f"inst_{inst_id}/time_min": elapsed / 60,
+                f"inst_{inst_id}/throughput": throughput,
                 "institutions_completed": len(results),
+                "total_rows_written": sum(int(Path(p).stem.split("_")[-1]) if "_" in Path(p).stem else 0 for p in results.values()) + rows_written,
             })
 
         # Cleanup institution
