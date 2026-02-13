@@ -119,7 +119,7 @@ def evaluate_per_institution(
         per_target_timepoint: {target_name: {t: {mse, mae, rmse}}}
     }}
     """
-    from intraop_dataset import StreamingIntraOpDataset
+    import pandas as pd
 
     model.eval()
     results = {}
@@ -135,27 +135,34 @@ def evaluate_per_institution(
 
         print(f"\n  Evaluating institution {inst_id}...")
 
-        # Create dataset for this institution
-        print(f"    Creating dataset...", flush=True)
-        dataset = StreamingIntraOpDataset(
-            file_paths=[file_path],
+        # Load institution data (one at a time - fits in memory)
+        print(f"    Loading data...", flush=True)
+        df = pd.read_feather(file_path)
+
+        if debug_frac is not None:
+            case_ids = df['mpog_case_id'].unique()
+            n_sample = max(1, int(len(case_ids) * debug_frac))
+            sampled_ids = np.random.choice(case_ids, size=n_sample, replace=False)
+            df = df[df['mpog_case_id'].isin(sampled_ids)]
+
+        print(f"    Rows: {len(df):,}", flush=True)
+
+        # Use fast IntraOpDataset (not streaming)
+        from intraop_dataset import IntraOpDataset
+        dataset = IntraOpDataset(
+            df=df,
             config=config,
             vocabs=vocabs,
             split="test",
-            shuffle_files=False,
-            shuffle_samples=False,
-            debug_frac=debug_frac,
-            seed=42,
         )
-        print(f"    Dataset created, starting inference...", flush=True)
+        print(f"    Samples: {len(dataset):,}, starting inference...", flush=True)
 
         loader = DataLoader(
             dataset,
             batch_size=config["batch_size_bp"],
             shuffle=False,
-            num_workers=0,
+            num_workers=4,
             pin_memory=True,
-            collate_fn=StreamingIntraOpDataset.collate_fn,
         )
 
         # Accumulators for detailed metrics
