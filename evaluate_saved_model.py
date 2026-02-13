@@ -307,7 +307,7 @@ def main():
             print(f"  Data dir: {args.data_dir}")
             sys.exit(1)
 
-        train_df = pd.read_parquet(train_file)
+        train_df = pd.read_feather(train_file)
 
         if args.debug:
             train_df = train_df.sample(frac=0.01, random_state=42)
