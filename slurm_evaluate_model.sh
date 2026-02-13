@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=eval_model
-#SBATCH --partition=gpu
-#SBATCH --gres=gpu:v100:1
+#SBATCH --partition=spgpu
+#SBATCH --gres=gpu:titanv:1
 #SBATCH --mem=64G
 #SBATCH --cpus-per-task=8
 #SBATCH --time=12:00:00
