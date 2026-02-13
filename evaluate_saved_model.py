@@ -118,7 +118,7 @@ def predict_with_row_output(
     import pyarrow as pa
     import pyarrow.parquet as pq
     from torch.utils.data import DataLoader, Subset
-    from intraop_dataset import IntraOpDataset
+    from intraop_dataset import FastInferenceDataset
 
     model.eval()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -152,12 +152,11 @@ def predict_with_row_output(
         n_rows = len(df)
         print(f"    Rows: {n_rows:,}")
 
-        # Create full dataset
-        dataset = IntraOpDataset(
+        # Create fast inference dataset (pre-converts all data to numpy)
+        dataset = FastInferenceDataset(
             df=df,
             config=config,
             vocabs=vocabs,
-            split="test",
         )
 
         n_valid = len(dataset)
