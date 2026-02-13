@@ -128,7 +128,7 @@ def predict_with_row_output(
         print(f"\n  Processing institution {inst_id}...")
 
         # Load dataframe
-        df = pd.read_parquet(file_path)
+        df = pd.read_feather(file_path)
 
         if debug_frac:
             df = df.sample(frac=debug_frac, random_state=42).reset_index(drop=True)
