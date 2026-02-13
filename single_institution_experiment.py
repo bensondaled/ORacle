@@ -399,6 +399,10 @@ def main():
     # Build vocab
     vocabs = build_vocab(train_df, config.get("static_categoricals", []))
 
+    # Save vocabs for later evaluation
+    with open(output_dir / "vocabs.json", "w") as f:
+        json.dump(vocabs, f, indent=2)
+
     # Get test institution files (all except training institution)
     all_institutions = set(INSTITUTION_METADATA.keys()) - {args.institution}
     test_file_paths = []

@@ -4,7 +4,7 @@
 #SBATCH --gres=gpu:titanv:1
 #SBATCH --mem=64G
 #SBATCH --cpus-per-task=8
-#SBATCH --time=12:00:00
+#SBATCH --time=300:00:00
 #SBATCH --output=/home/%u/logs/eval_model_%j.out
 #SBATCH --error=/home/%u/logs/eval_model_%j.err
 

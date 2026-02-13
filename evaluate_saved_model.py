@@ -289,22 +289,36 @@ def main():
 
     print(f"\nTest institutions: {len(test_file_paths)}")
 
-    # Build vocabs from training data
-    print("\nBuilding vocabs from training institution...")
-    import pandas as pd
-    train_file = get_institution_file(Path(args.data_dir), training_institution)
-    train_df = pd.read_parquet(train_file)
+    # Load vocabs (saved during training)
+    vocabs_path = model_dir / "vocabs.json"
+    if vocabs_path.exists():
+        print(f"\nLoading vocabs from {vocabs_path}")
+        with open(vocabs_path) as f:
+            vocabs = json.load(f)
+    else:
+        # Fallback: rebuild from training data
+        print("\nBuilding vocabs from training institution...")
+        import pandas as pd
+        train_file = get_institution_file(Path(args.data_dir), training_institution)
+        print(f"  Training file: {train_file}")
 
-    if args.debug:
-        train_df = train_df.sample(frac=0.01, random_state=42)
+        if train_file is None or not Path(train_file).exists():
+            print(f"  ERROR: Training file not found for institution {training_institution}")
+            print(f"  Data dir: {args.data_dir}")
+            sys.exit(1)
 
-    vocabs = {}
-    for col in config.get("static_categoricals", []):
-        if col in train_df.columns:
-            unique_vals = train_df[col].dropna().unique()
-            vocabs[col] = {v: i + 1 for i, v in enumerate(sorted(unique_vals))}
+        train_df = pd.read_parquet(train_file)
 
-    del train_df
+        if args.debug:
+            train_df = train_df.sample(frac=0.01, random_state=42)
+
+        vocabs = {}
+        for col in config.get("static_categoricals", []):
+            if col in train_df.columns:
+                unique_vals = train_df[col].dropna().unique()
+                vocabs[col] = {v: i + 1 for i, v in enumerate(sorted(unique_vals))}
+
+        del train_df
 
     debug_frac = 0.01 if args.debug else None
 
