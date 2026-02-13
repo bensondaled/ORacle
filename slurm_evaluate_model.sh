@@ -35,8 +35,10 @@ DATA_DIR="${DATA_DIR:-/nfs/turbo/umms-sachinkh/PCRC 247 Aghaeepour/output_all/pc
 ORACLE_DIR="${ORACLE_DIR:-$HOME/ORacle}"
 POETRY_DIR="${POETRY_DIR:-$HOME/pcrc_0247_duckdb}"
 
-# Evaluation settings
-BATCH_SIZE="${BATCH_SIZE:-256}"
+# Evaluation settings - optimized for GPU throughput
+BATCH_SIZE="${BATCH_SIZE:-4096}"
+CHUNK_SIZE="${CHUNK_SIZE:-500000}"
+NUM_WORKERS="${NUM_WORKERS:-8}"
 SAVE_PREDS="${SAVE_PREDS:-0}"
 PREDICTIONS_DIR="${PREDICTIONS_DIR:-}"
 
@@ -98,6 +100,9 @@ echo "Data Dir:      ${DATA_DIR}"
 echo "Debug Mode:    ${DEBUG}"
 echo "Save Preds:    ${SAVE_PREDS}"
 echo "Batch Size:    ${BATCH_SIZE}"
+echo "Chunk Size:    ${CHUNK_SIZE}"
+echo "Num Workers:   ${NUM_WORKERS}"
+echo "Half Prec:     ${HALF_PRECISION}"
 echo "Start:         $(date)"
 echo "=============================================="
 
@@ -130,6 +135,8 @@ CMD="${ORACLE_DIR}/evaluate_saved_model.py"
 CMD="${CMD} --model-dir \"${MODEL_DIR}\""
 CMD="${CMD} --data-dir \"${DATA_DIR}\""
 CMD="${CMD} --batch-size ${BATCH_SIZE}"
+CMD="${CMD} --chunk-size ${CHUNK_SIZE}"
+CMD="${CMD} --num-workers ${NUM_WORKERS}"
 
 if [ "${DEBUG}" = "1" ]; then
     CMD="${CMD} --debug"

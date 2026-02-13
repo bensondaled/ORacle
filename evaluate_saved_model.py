@@ -52,8 +52,16 @@ def parse_args():
         help="Output directory (default: model-dir)"
     )
     parser.add_argument(
-        "--batch-size", type=int, default=256,
-        help="Batch size for evaluation"
+        "--batch-size", type=int, default=4096,
+        help="Batch size for evaluation (default 4096, increase for faster GPU throughput)"
+    )
+    parser.add_argument(
+        "--chunk-size", type=int, default=500000,
+        help="Rows per chunk for writing (default 500k, larger = faster but more memory)"
+    )
+    parser.add_argument(
+        "--num-workers", type=int, default=8,
+        help="DataLoader workers (default 8, increase if CPU bottlenecked)"
     )
     parser.add_argument(
         "--debug", action="store_true",
@@ -90,9 +98,10 @@ def predict_with_row_output(
     vocabs: dict,
     device: torch.device,
     output_dir: Path,
-    batch_size: int = 512,
+    batch_size: int = 4096,
     debug_frac: float = None,
-    chunk_size: int = 200000,  # Write in chunks (larger = faster, more memory)
+    chunk_size: int = 500000,  # Write in chunks (larger = faster, more memory)
+    num_workers: int = 8,
     wandb_run=None,
     use_half: bool = False,
 ) -> dict:
@@ -171,38 +180,40 @@ def predict_with_row_output(
                     subset,
                     batch_size=batch_size,
                     shuffle=False,
-                    num_workers=4,
+                    num_workers=num_workers,
                     pin_memory=True,
                     persistent_workers=True,
+                    prefetch_factor=4,
+                    drop_last=False,
                 )
 
                 # Collect predictions for this chunk
                 chunk_preds = []
 
-                with torch.no_grad():
+                with torch.inference_mode(), torch.cuda.amp.autocast(enabled=use_half):
                     for batch in loader:
+                        # Move all tensors to GPU non-blocking
                         for k, v in batch.items():
                             if torch.is_tensor(v):
                                 batch[k] = v.to(device, non_blocking=True)
                             elif k == "static_cat" and isinstance(v, dict):
-                                batch[k] = {sk: sv.to(device) for sk, sv in v.items()}
+                                batch[k] = {sk: sv.to(device, non_blocking=True) for sk, sv in v.items()}
 
-                        dtype = torch.float16 if use_half else torch.float32
                         preds, _, _ = model(
-                            vitals=batch["vitals"].to(dtype),
-                            meds=batch["meds"].to(dtype),
-                            gases=batch["gases"].to(dtype),
-                            bolus=batch["bolus"].to(dtype),
+                            vitals=batch["vitals"],
+                            meds=batch["meds"],
+                            gases=batch["gases"],
+                            bolus=batch["bolus"],
                             attention_mask=batch["attention_mask"].bool(),
                             static_cat=batch.get("static_cat"),
-                            static_num=batch.get("static_num") if batch.get("static_num") is None else batch["static_num"].to(dtype),
+                            static_num=batch.get("static_num"),
                             future_steps=n_timepoints,
                         )
 
                         if preds.dim() == 2:
                             preds = preds.unsqueeze(-1)
 
-                        chunk_preds.append(preds.cpu().numpy())
+                        chunk_preds.append(preds.float().cpu().numpy())
 
                 # Stack chunk predictions
                 chunk_preds = np.concatenate(chunk_preds, axis=0)
@@ -403,6 +414,8 @@ def main():
             output_dir=pred_dir,
             batch_size=args.batch_size,
             debug_frac=debug_frac,
+            chunk_size=args.chunk_size,
+            num_workers=args.num_workers,
             wandb_run=wandb_run,
             use_half=args.half,
         )
