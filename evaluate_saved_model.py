@@ -75,6 +75,10 @@ def parse_args():
         "--no-wandb", action="store_true",
         help="Disable WandB logging"
     )
+    parser.add_argument(
+        "--half", action="store_true",
+        help="Use half precision (FP16) for faster inference"
+    )
 
     return parser.parse_args()
 
@@ -90,6 +94,7 @@ def predict_with_row_output(
     debug_frac: float = None,
     chunk_size: int = 200000,  # Write in chunks (larger = faster, more memory)
     wandb_run=None,
+    use_half: bool = False,
 ) -> dict:
     """
     Generate predictions for each row and save to parquet.
@@ -182,14 +187,15 @@ def predict_with_row_output(
                             elif k == "static_cat" and isinstance(v, dict):
                                 batch[k] = {sk: sv.to(device) for sk, sv in v.items()}
 
+                        dtype = torch.float16 if use_half else torch.float32
                         preds, _, _ = model(
-                            vitals=batch["vitals"].float(),
-                            meds=batch["meds"].float(),
-                            gases=batch["gases"].float(),
-                            bolus=batch["bolus"].float(),
+                            vitals=batch["vitals"].to(dtype),
+                            meds=batch["meds"].to(dtype),
+                            gases=batch["gases"].to(dtype),
+                            bolus=batch["bolus"].to(dtype),
                             attention_mask=batch["attention_mask"].bool(),
                             static_cat=batch.get("static_cat"),
-                            static_num=batch.get("static_num"),
+                            static_num=batch.get("static_num") if batch.get("static_num") is None else batch["static_num"].to(dtype),
                             future_steps=n_timepoints,
                         )
 
@@ -301,8 +307,19 @@ def main():
     model = model.to(device)
     model.eval()
 
+    # Half precision for faster inference
+    if args.half:
+        model = model.half()
+        print("Using half precision (FP16)")
+
     print(f"Loaded model from epoch {checkpoint.get('epoch', '?')}")
     print(f"Validation loss: {checkpoint.get('val_loss', '?'):.4f}")
+
+    # GPU memory info
+    if torch.cuda.is_available():
+        total_mem = torch.cuda.get_device_properties(0).total_memory / 1e9
+        allocated = torch.cuda.memory_allocated() / 1e9
+        print(f"GPU memory: {allocated:.1f}GB used / {total_mem:.1f}GB total")
 
     # Initialize WandB
     wandb_run = None
@@ -387,6 +404,7 @@ def main():
             batch_size=args.batch_size,
             debug_frac=debug_frac,
             wandb_run=wandb_run,
+            use_half=args.half,
         )
 
         # Save index of prediction files

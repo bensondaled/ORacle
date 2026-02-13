@@ -44,6 +44,9 @@ PREDICTIONS_DIR="${PREDICTIONS_DIR:-}"
 WANDB_PROJECT="${WANDB_PROJECT:-oracle-eval}"
 NO_WANDB="${NO_WANDB:-0}"
 
+# Performance
+HALF_PRECISION="${HALF_PRECISION:-1}"  # Default ON for speed
+
 # -----------------------------
 # Environment
 # -----------------------------
@@ -144,6 +147,10 @@ CMD="${CMD} --wandb-project ${WANDB_PROJECT}"
 
 if [ "${NO_WANDB}" = "1" ]; then
     CMD="${CMD} --no-wandb"
+fi
+
+if [ "${HALF_PRECISION}" = "1" ]; then
+    CMD="${CMD} --half"
 fi
 
 # Run
