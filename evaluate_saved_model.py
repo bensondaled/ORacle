@@ -364,7 +364,6 @@ def main():
         config=config,
         vocabs=vocabs,
         device=device,
-        batch_size=args.batch_size,
         debug_frac=debug_frac,
     )
 
