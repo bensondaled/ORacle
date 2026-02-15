@@ -104,12 +104,14 @@ def predict_with_row_output(
     num_workers: int = 8,
     wandb_run=None,
     use_half: bool = False,
+    resume: bool = True,
 ) -> dict:
     """
     Generate predictions for each row and save to parquet.
 
     Memory efficient: streams predictions in chunks, writes incrementally.
     Processes one institution at a time.
+    Supports resume: skips completed institutions, deletes partial files.
 
     Returns dict of {inst_id: output_file_path}
     """
@@ -133,12 +135,34 @@ def predict_with_row_output(
         for t in range(n_timepoints):
             pred_cols.append(f"pred_{tgt_name}_t{t+1}")
 
+    # Resume support: track completed institutions
+    completed_file = output_dir / "completed_institutions.json"
+    completed_institutions = set()
+    if resume and completed_file.exists():
+        with open(completed_file) as f:
+            completed_institutions = set(json.load(f))
+        print(f"  Resuming: {len(completed_institutions)} institutions already completed")
+
     results = {}
 
     for file_path in file_paths:
         # Extract institution ID
         fname = Path(file_path).stem
         inst_id = int(fname.split("_")[-1]) if "_" in fname else int(fname)
+
+        # Skip if already completed
+        if inst_id in completed_institutions:
+            output_file = output_dir / f"predictions_{inst_id}.parquet"
+            if output_file.exists():
+                print(f"\n  Skipping institution {inst_id} (already completed)")
+                results[inst_id] = str(output_file)
+                continue
+
+        # Delete any partial file from previous run
+        output_file = output_dir / f"predictions_{inst_id}.parquet"
+        if output_file.exists():
+            print(f"\n  Deleting partial file for institution {inst_id}")
+            output_file.unlink()
 
         print(f"\n  Processing institution {inst_id}...")
         inst_start = time.time()
@@ -247,6 +271,11 @@ def predict_with_row_output(
         throughput = rows_written / elapsed if elapsed > 0 else 0
         print(f"    Saved: {output_file} ({rows_written:,} rows in {elapsed/60:.1f}min, {throughput:.0f} rows/s)")
         results[inst_id] = str(output_file)
+
+        # Mark as completed (for resume support)
+        completed_institutions.add(inst_id)
+        with open(completed_file, "w") as f:
+            json.dump(list(completed_institutions), f)
 
         # Log to WandB
         if wandb_run is not None:
