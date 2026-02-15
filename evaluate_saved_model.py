@@ -150,19 +150,13 @@ def predict_with_row_output(
         fname = Path(file_path).stem
         inst_id = int(fname.split("_")[-1]) if "_" in fname else int(fname)
 
-        # Skip if already completed
-        if inst_id in completed_institutions:
-            output_file = output_dir / f"predictions_{inst_id}.parquet"
-            if output_file.exists():
-                print(f"\n  Skipping institution {inst_id} (already completed)")
-                results[inst_id] = str(output_file)
-                continue
-
-        # Delete any partial file from previous run
+        # Skip if output file already exists (assume complete)
         output_file = output_dir / f"predictions_{inst_id}.parquet"
         if output_file.exists():
-            print(f"\n  Deleting partial file for institution {inst_id}")
-            output_file.unlink()
+            print(f"\n  Skipping institution {inst_id} (file exists)")
+            results[inst_id] = str(output_file)
+            completed_institutions.add(inst_id)
+            continue
 
         print(f"\n  Processing institution {inst_id}...")
         inst_start = time.time()
