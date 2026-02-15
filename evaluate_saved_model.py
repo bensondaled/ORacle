@@ -52,8 +52,8 @@ def parse_args():
         help="Output directory (default: model-dir)"
     )
     parser.add_argument(
-        "--batch-size", type=int, default=65536,
-        help="Batch size for evaluation (default 65536, decrease if OOM)"
+        "--batch-size", type=int, default=16000,
+        help="Batch size for evaluation (default 16000, decrease if OOM)"
     )
     parser.add_argument(
         "--chunk-size", type=int, default=500000,
@@ -98,7 +98,7 @@ def predict_with_row_output(
     vocabs: dict,
     device: torch.device,
     output_dir: Path,
-    batch_size: int = 65536,
+    batch_size: int = 16000,
     debug_frac: float = None,
     chunk_size: int = 500000,  # Write in chunks (larger = faster, more memory)
     num_workers: int = 8,
